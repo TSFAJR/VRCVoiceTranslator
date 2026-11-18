@@ -1,0 +1,15 @@
+.dotnet/
+.dotnet-sdk.zip
+.packages/
+bin/
+obj/
+artifacts/
+.vs/
+.env
+.env.*
+config.json
+*.log
+*.user
+*.tmp
+/圆角蓝色波形图标.png
+!src/App/OpenVR/openvr_api.dll

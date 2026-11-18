@@ -1,0 +1,29 @@
+{
+  "action_sets": [
+    { "name": "/actions/translator", "usage": "leftright" }
+  ],
+  "actions": [
+    { "name": "/actions/translator/in/PushToTalk", "type": "boolean", "requirement": "optional" },
+    { "name": "/actions/translator/in/PushToTalkA", "type": "boolean", "requirement": "optional" },
+    { "name": "/actions/translator/in/PushToTalkB", "type": "boolean", "requirement": "optional" }
+  ],
+  "default_bindings": [
+    { "controller_type": "oculus_touch", "binding_url": "bindings_oculus_touch.json" }
+  ],
+  "localization": [
+    {
+      "language_tag": "en_us",
+      "/actions/translator": "Voice Translator",
+      "/actions/translator/in/PushToTalk": "PushToTalk (Chord)",
+      "/actions/translator/in/PushToTalkA": "PushToTalkA (First button)",
+      "/actions/translator/in/PushToTalkB": "PushToTalkB (Second button)"
+    },
+    {
+      "language_tag": "zh_cn",
+      "/actions/translator": "语音翻译",
+      "/actions/translator/in/PushToTalk": "PushToTalk（原生组合键）",
+      "/actions/translator/in/PushToTalkA": "PushToTalkA（按键 A）",
+      "/actions/translator/in/PushToTalkB": "PushToTalkB（按键 B）"
+    }
+  ]
+}

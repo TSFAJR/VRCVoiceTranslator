@@ -1,0 +1,33 @@
+{
+  "action_manifest_version": 0,
+  "app_key": "com.vrcvoicetranslator.overlay",
+  "category": "steamvr_input",
+  "controller_type": "oculus_touch",
+  "name": "VRC Voice Translator · Left Trigger + Right Grip",
+  "description": "Hold the left trigger and right grip to talk. Includes the chord and two-button actions.",
+  "bindings": {
+    "/actions/translator": {
+      "chords": [
+        {
+          "inputs": [
+            ["/user/hand/left/input/trigger", "click"],
+            ["/user/hand/right/input/grip", "click"]
+          ],
+          "output": "/actions/translator/in/PushToTalk"
+        }
+      ],
+      "sources": [
+        {
+          "path": "/user/hand/left/input/trigger",
+          "mode": "button",
+          "inputs": { "click": { "output": "/actions/translator/in/PushToTalkA" } }
+        },
+        {
+          "path": "/user/hand/right/input/grip",
+          "mode": "button",
+          "inputs": { "click": { "output": "/actions/translator/in/PushToTalkB" } }
+        }
+      ]
+    }
+  }
+}

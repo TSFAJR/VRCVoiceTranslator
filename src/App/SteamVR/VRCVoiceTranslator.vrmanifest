@@ -1,0 +1,16 @@
+{
+  "source": "builtin",
+  "applications": [
+    {
+      "app_key": "com.vrcvoicetranslator.overlay",
+      "launch_type": "binary",
+      "binary_path_windows": "VRCVoiceTranslator.exe",
+      "action_manifest_path": "vrc_actions.json",
+      "is_dashboard_overlay": true,
+      "strings": {
+        "en_us": { "name": "VRC Voice Translator", "description": "Push-to-talk and headset subtitles" },
+        "zh_cn": { "name": "VRChat 语音翻译", "description": "按住说话与头显字幕" }
+      }
+    }
+  ]
+}
