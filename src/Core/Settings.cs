@@ -11,6 +11,8 @@ public sealed record Settings
 {
     public const string DefaultEndpoint = "wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference";
     public string? MicrophoneId { get; init; }
+    public string? IncomingPlaybackDeviceId { get; init; }
+    public bool IncomingStrongerNoiseFilter { get; init; }
     public int KeyboardVirtualKey { get; init; } = 0x77;
     public VrBindingMode VrBinding { get; init; } = VrBindingMode.Chord;
     public bool ExperimentalVrInputOverride { get; init; }
@@ -23,6 +25,7 @@ public sealed record Settings
     public bool ChatboxEnabled { get; init; } = true;
     public int OscPort { get; init; } = 9000;
     public SubtitleSettings Subtitles { get; init; } = new();
+    public SpeechSettings Speech { get; init; } = new();
 
     public Settings Validate()
     {
@@ -30,7 +33,7 @@ public sealed record Settings
         if (!Enum.IsDefined(VrBinding) || !Enum.IsDefined(SourceLanguage)) throw new FormatException("输入模式或语音语言无效。");
         if (MaxRecordingSeconds is < 1 or > 60) throw new FormatException("录音上限应为 1–60 秒。");
         if (OscPort is < 1 or > 65535) throw new FormatException("OSC 端口应为 1–65535。");
-        if (BailianEndpoint is null || BailianApiKey is null || DeepLApiKey is null || TargetLanguages is null || Subtitles is null)
+        if (BailianEndpoint is null || BailianApiKey is null || DeepLApiKey is null || TargetLanguages is null || Subtitles is null || Speech is null)
             throw new FormatException("必填配置字段不能为 null。");
         string endpoint = BailianEndpoint.Trim();
         if (endpoint != DefaultEndpoint && !IsWebSocketEndpoint(endpoint))
@@ -38,7 +41,7 @@ public sealed record Settings
         string[] targets = TargetLanguages.Select(NormalizeTarget).Distinct(StringComparer.Ordinal).ToArray();
         Subtitles.Validate();
         return this with { BailianEndpoint = endpoint, BailianApiKey = BailianApiKey.Trim(),
-            DeepLApiKey = DeepLApiKey.Trim(), TargetLanguages = targets };
+            DeepLApiKey = DeepLApiKey.Trim(), TargetLanguages = targets, Speech = Speech.Validate() };
     }
 
     public static bool IsWebSocketEndpoint(string address) =>

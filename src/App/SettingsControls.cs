@@ -59,7 +59,7 @@ internal sealed class SettingsButton : Button
         this.glyph = glyph;
         FlatStyle = FlatStyle.Flat;
         FlatAppearance.BorderSize = 0;
-        SetStyle(ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        SetStyle(ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
         Cursor = Cursors.Hand;
     }
 
@@ -176,7 +176,11 @@ internal sealed class SettingsButton : Button
 
 internal sealed class SettingsCard : Panel
 {
-    public SettingsCard() => DoubleBuffered = true;
+    public SettingsCard()
+    {
+        DoubleBuffered = true;
+        ResizeRedraw = true;
+    }
 
     protected override void OnPaint(PaintEventArgs e)
     {
@@ -189,7 +193,12 @@ internal sealed class SettingsCard : Panel
 internal sealed class SettingsPage : Panel
 {
     private readonly List<(Control Control, Rectangle Design)> placements = [];
-    public SettingsPage() { BackColor = SettingsTheme.Surface; DoubleBuffered = true; }
+    public SettingsPage()
+    {
+        BackColor = SettingsTheme.Surface;
+        DoubleBuffered = true;
+        ResizeRedraw = true;
+    }
 
     public T Place<T>(T control, int x, int y, int width, int height) where T : Control
     {
@@ -233,6 +242,7 @@ internal sealed class TextFrame : Panel
     {
         this.input = input;
         DoubleBuffered = true;
+        ResizeRedraw = true;
         Fill = preview ? Color.FromArgb(235, 241, 245) : Color.FromArgb(253, 254, 254);
         input.BorderStyle = BorderStyle.None;
         input.BackColor = Fill;
@@ -289,7 +299,7 @@ internal sealed class SettingsSwitch : CheckBox
     {
         AccessibleName = name;
         Cursor = Cursors.Hand;
-        SetStyle(ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
+        SetStyle(ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
     }
 
     protected override void OnPaint(PaintEventArgs e)
@@ -352,6 +362,7 @@ internal sealed class NumberFrame : Panel
     {
         this.number = number;
         DoubleBuffered = true;
+        ResizeRedraw = true;
         number.BorderStyle = BorderStyle.None;
         number.BackColor = Color.FromArgb(253, 254, 254);
         number.Enter += (_, _) => Invalidate();
@@ -379,6 +390,8 @@ internal sealed class StatusIndicator : Control
 {
     private Color color = SettingsTheme.InputLine;
 
+    public StatusIndicator() => ResizeRedraw = true;
+
     public void SetConnected(bool connected)
     {
         var next = connected ? SettingsTheme.Green : SettingsTheme.InputLine;
@@ -398,7 +411,11 @@ internal sealed class StatusIndicator : Control
 
 internal sealed class SettingsBadge : Label
 {
-    public SettingsBadge() => DoubleBuffered = true;
+    public SettingsBadge()
+    {
+        DoubleBuffered = true;
+        ResizeRedraw = true;
+    }
 
     protected override void OnPaint(PaintEventArgs e)
     {
@@ -424,6 +441,7 @@ internal sealed class SettingsSlider : Control
         AccessibleRole = AccessibleRole.Slider;
         TabStop = true;
         DoubleBuffered = true;
+        ResizeRedraw = true;
         Cursor = Cursors.Hand;
         value.ValueChanged += (_, _) => { AccessibleDescription = value.Value.ToString(); Invalidate(); };
     }
@@ -488,7 +506,13 @@ internal sealed class SettingsSlider : Control
 internal sealed class SegmentedMeter : Control
 {
     private int level;
-    public SegmentedMeter() { DoubleBuffered = true; AccessibleName = "输入电平"; AccessibleRole = AccessibleRole.ProgressBar; }
+    public SegmentedMeter()
+    {
+        DoubleBuffered = true;
+        ResizeRedraw = true;
+        AccessibleName = "输入电平";
+        AccessibleRole = AccessibleRole.ProgressBar;
+    }
     public void SetLevel(int value)
     {
         if (level == value) return;

@@ -18,10 +18,10 @@ internal sealed class RecordingSession : IDisposable
     public Settings Settings { get; }
     public Task<CompletedTake> Work { get; }
 
-    public RecordingSession(Settings settings, BailianClient asr, DeepLClient deepL, Action<string> log)
+    public RecordingSession(Settings settings, BailianClient asr, DeepLClient deepL, Action<string> log, Action<SpeechSelection> announce)
     {
         Settings = settings;
-        Work = Task.Run(() => ProcessAsync(asr, deepL, log));
+        Work = Task.Run(() => ProcessAsync(asr, deepL, log, announce));
     }
 
     public void Submit()
@@ -34,7 +34,7 @@ internal sealed class RecordingSession : IDisposable
 
     public void Cancel() => cancelled.Cancel();
 
-    private async Task<CompletedTake> ProcessAsync(BailianClient asr, DeepLClient deepL, Action<string> log)
+    private async Task<CompletedTake> ProcessAsync(BailianClient asr, DeepLClient deepL, Action<string> log, Action<SpeechSelection> announce)
     {
         cancelled.Token.ThrowIfCancellationRequested();
         if (released.Task.IsCompleted) return new(null, []);
@@ -101,7 +101,7 @@ internal sealed class RecordingSession : IDisposable
         Volatile.Write(ref phase, (int)VoicePhase.Translating);
         log("开始翻译。");
         long start = Stopwatch.GetTimestamp();
-        var batch = await deepL.TranslateAsync(original, Settings, cancelled.Token).ConfigureAwait(false);
+        var batch = await TakeTranslation.TranslateAsync(deepL, original, Settings, announce, cancelled.Token).ConfigureAwait(false);
         log($"原文至译文就绪：{Stopwatch.GetElapsedTime(start).TotalMilliseconds:F0} 毫秒，译文 {batch.Results.Count} 项");
         return new(new(original, batch.Results), batch.Errors);
     }

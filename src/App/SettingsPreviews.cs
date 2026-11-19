@@ -25,6 +25,8 @@ internal sealed class LanguageOrder : ListBox
     {
         BorderStyle = BorderStyle.None;
         DrawMode = DrawMode.OwnerDrawFixed;
+        // The row's rounded border and trailing actions move when its width changes.
+        ResizeRedraw = true;
         IntegralHeight = false;
         AllowDrop = true;
         TabStop = true;
@@ -195,7 +197,12 @@ internal sealed class LanguageOrder : ListBox
 internal sealed class HeadsetPreview : Control
 {
     private SubtitleSettings options = new();
-    public HeadsetPreview() { DoubleBuffered = true; AccessibleName = "头显字幕位置预览"; }
+    public HeadsetPreview()
+    {
+        DoubleBuffered = true;
+        ResizeRedraw = true;
+        AccessibleName = "头显字幕位置预览";
+    }
     public void SetOptions(SubtitleSettings value) { options = value; Invalidate(); }
 
     protected override void OnPaint(PaintEventArgs e)

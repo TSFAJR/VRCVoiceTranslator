@@ -13,7 +13,8 @@ public sealed class DeepLClient(HttpClient http, TimeSpan? timeout = null)
     private static readonly Uri Endpoint = new("https://api-free.deepl.com/v2/translate");
     private readonly TimeSpan wait = timeout ?? TimeSpan.FromSeconds(5);
 
-    public async Task<TranslationBatch> TranslateAsync(string original, Settings settings, CancellationToken cancellation)
+    public async Task<TranslationBatch> TranslateAsync(string original, Settings settings, CancellationToken cancellation,
+        Action<Translation>? onTranslation = null)
     {
         string? source = settings.SourceLanguage switch
         {
@@ -26,7 +27,7 @@ public sealed class DeepLClient(HttpClient http, TimeSpan? timeout = null)
 
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         deadline.CancelAfter(wait);
-        var tasks = targets.Select(target => RequestAsync(original, source, target, settings.DeepLApiKey, deadline.Token)).ToArray();
+        var tasks = targets.Select(TranslateTargetAsync).ToArray();
         try { await Task.WhenAll(tasks).WaitAsync(deadline.Token).ConfigureAwait(false); }
         catch (OperationCanceledException) when (!cancellation.IsCancellationRequested) { }
         cancellation.ThrowIfCancellationRequested();
@@ -40,6 +41,13 @@ public sealed class DeepLClient(HttpClient http, TimeSpan? timeout = null)
             if (result.Error is { } error) errors.Add(error);
         }
         return new(results, errors);
+
+        async Task<Outcome> TranslateTargetAsync(string target)
+        {
+            var result = await RequestAsync(original, source, target, settings.DeepLApiKey, deadline.Token).ConfigureAwait(false);
+            if (result.Value is { } translation && !deadline.IsCancellationRequested) onTranslation?.Invoke(translation);
+            return result;
+        }
     }
 
     private async Task<Outcome> RequestAsync(string original, string? source, string target, string key, CancellationToken cancellation)

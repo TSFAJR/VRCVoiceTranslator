@@ -5,6 +5,12 @@ using System.Text.Json;
 namespace VrcTranslator;
 
 public sealed class ServiceException(string message) : Exception(message);
+internal sealed class BailianConnectionException(string message, int status) : Exception(message)
+{
+    public bool CanRetry => status is not (400 or 401 or 403 or 404);
+}
+
+public readonly record struct RecognizedSentence(string Text, int? EndMilliseconds);
 
 public sealed class BailianClient
 {
@@ -19,7 +25,15 @@ public sealed class BailianClient
         this.startupTimeout = startupTimeout ?? TimeSpan.FromSeconds(8);
     }
 
-    public async Task<string> RecognizeAsync(Settings settings, IAsyncEnumerable<byte[]> audio, CancellationToken cancellation)
+    public Task<string> RecognizeAsync(Settings settings, IAsyncEnumerable<byte[]> audio, CancellationToken cancellation) =>
+        RecognizeCoreAsync(settings, audio, onSentence: null, onStarted: null, cancellation);
+
+    public async Task StreamSentencesAsync(Settings settings, IAsyncEnumerable<byte[]> audio,
+        Action<RecognizedSentence> onSentence, CancellationToken cancellation, Action? onStarted = null) =>
+        _ = await RecognizeCoreAsync(settings, audio, onSentence, onStarted, cancellation).ConfigureAwait(false);
+
+    private async Task<string> RecognizeCoreAsync(Settings settings, IAsyncEnumerable<byte[]> audio,
+        Action<RecognizedSentence>? onSentence, Action? onStarted, CancellationToken cancellation)
     {
         if (string.IsNullOrWhiteSpace(settings.BailianApiKey)) throw new ServiceException("请填写百炼 API Key。");
         if (!Settings.IsWebSocketEndpoint(settings.BailianEndpoint)) throw new ServiceException("请填写百炼工作空间的 WebSocket 地址。");
@@ -36,15 +50,21 @@ public sealed class BailianClient
         try
         {
             socket = await connect(settings, startup.Token).ConfigureAwait(false);
-            await SendJsonAsync(socket, "run-task", id, RunPayload(settings.SourceLanguage), startup.Token).ConfigureAwait(false);
-            receiver = ReceiveResultsAsync(socket, id, ready, finishing.Task, lifetime.Token);
+            await SendJsonAsync(socket, "run-task", id, RunPayload(settings, incoming: onSentence is not null), startup.Token).ConfigureAwait(false);
+            receiver = ReceiveResultsAsync(socket, id, ready, finishing.Task, onSentence, lifetime.Token);
             var startedOrEnded = await Task.WhenAny(ready.Task, receiver).WaitAsync(startup.Token).ConfigureAwait(false);
             if (startedOrEnded == receiver) return await receiver.ConfigureAwait(false);
             startup.CancelAfter(Timeout.InfiniteTimeSpan);
+            onStarted?.Invoke();
 
             sender = SendAudioAsync(socket, id, audio, finishing, lifetime.Token);
             var first = await Task.WhenAny(sender, receiver).ConfigureAwait(false);
-            if (first == sender) await sender.ConfigureAwait(false);
+            if (first == sender)
+            {
+                await sender.ConfigureAwait(false);
+                if (onSentence is not null)
+                    return await receiver.WaitAsync(TimeSpan.FromSeconds(5), lifetime.Token).ConfigureAwait(false);
+            }
             string result = await receiver.ConfigureAwait(false);
             await sender.ConfigureAwait(false);
             return result;
@@ -53,6 +73,10 @@ public sealed class BailianClient
         {
             throw new ServiceException("百炼连接或任务启动超时。");
         }
+        catch (BailianConnectionException exception) when (onSentence is null)
+        { throw new ServiceException(exception.Message); }
+        catch (TimeoutException) when (onSentence is not null)
+        { throw new ServiceException("百炼未及时结束来话识别任务。"); }
         catch (WebSocketException exception) when (!cancellation.IsCancellationRequested)
         {
             throw new ServiceException($"百炼 WebSocket 失败（{exception.WebSocketErrorCode}{HttpStatus(exception)}）。");
@@ -68,13 +92,13 @@ public sealed class BailianClient
         }
     }
 
-    private static string HttpStatus(WebSocketException exception)
+    internal static string HttpStatus(WebSocketException exception)
     {
         if (exception.InnerException is HttpRequestException { StatusCode: { } status }) return $" / HTTP {(int)status}";
         return "";
     }
 
-    private static async Task<WebSocket> ConnectAsync(Settings settings, CancellationToken cancellation)
+    internal static async Task<WebSocket> ConnectAsync(Settings settings, CancellationToken cancellation)
     {
         var socket = new ClientWebSocket();
         try
@@ -88,19 +112,24 @@ public sealed class BailianClient
         {
             int status = (int)socket.HttpStatusCode;
             socket.Dispose();
-            throw new ServiceException($"百炼握手失败（HTTP {status}）。");
+            throw new BailianConnectionException($"百炼握手失败（HTTP {status}）。", status);
         }
         catch { socket.Dispose(); throw; }
     }
 
-    private static object RunPayload(SourceLanguage language)
+    private static object RunPayload(Settings settings, bool incoming)
     {
         var parameters = new Dictionary<string, object>
         {
             ["format"] = "pcm", ["sample_rate"] = 16000,
             ["disfluency_removal_enabled"] = false, ["intermediate_result_enabled"] = false
         };
-        string? hint = language switch
+        if (incoming)
+        {
+            parameters["max_sentence_silence"] = 500;
+            if (settings.IncomingStrongerNoiseFilter) parameters["speech_noise_threshold"] = 0.1;
+        }
+        string? hint = settings.SourceLanguage switch
         {
             SourceLanguage.Chinese => "zh", SourceLanguage.English => "en",
             SourceLanguage.Japanese => "ja", SourceLanguage.Korean => "ko", _ => null
@@ -109,7 +138,7 @@ public sealed class BailianClient
         return new { task_group = "audio", task = "asr", function = "recognition", model = Model, parameters, input = new { } };
     }
 
-    private static Task SendJsonAsync(WebSocket socket, string action, string id, object payload, CancellationToken cancellation)
+    internal static Task SendJsonAsync(WebSocket socket, string action, string id, object payload, CancellationToken cancellation)
     {
         byte[] json = JsonSerializer.SerializeToUtf8Bytes(new { header = new { action, task_id = id, streaming = "duplex" }, payload });
         return socket.SendAsync(new ArraySegment<byte>(json), WebSocketMessageType.Text, true, cancellation);
@@ -122,6 +151,7 @@ public sealed class BailianClient
         int used = 0;
         await foreach (byte[] chunk in audio.WithCancellation(cancellation).ConfigureAwait(false))
         {
+            cancellation.ThrowIfCancellationRequested();
             int offset = 0;
             while (offset < chunk.Length)
             {
@@ -141,9 +171,10 @@ public sealed class BailianClient
     }
 
     private static async Task<string> ReceiveResultsAsync(WebSocket socket, string id, TaskCompletionSource ready,
-        Task finishing, CancellationToken cancellation)
+        Task finishing, Action<RecognizedSentence>? onSentence, CancellationToken cancellation)
     {
-        var sentences = new SortedDictionary<int, string>();
+        var sentences = onSentence is null ? new SortedDictionary<int, string>() : null;
+        int lastReported = 0;
         var bytes = new byte[8192];
         using var message = new MemoryStream();
         while (true)
@@ -171,11 +202,22 @@ public sealed class BailianClient
                         !True(sentence, "heartbeat") && True(sentence, "sentence_end") &&
                         Property(sentence, "sentence_id", out var number) && number.ValueKind == JsonValueKind.Number &&
                         number.TryGetInt32(out int index) && index > 0 && Text(sentence, "text", out var content) &&
-                        !string.IsNullOrWhiteSpace(content)) sentences[index] = content.Trim();
+                        !string.IsNullOrWhiteSpace(content))
+                    {
+                        if (sentences is not null) sentences[index] = content.Trim();
+                        else if (index > lastReported)
+                        {
+                            lastReported = index;
+                            int? end = Property(sentence, "end_time", out var timestamp) &&
+                                timestamp.ValueKind == JsonValueKind.Number && timestamp.TryGetInt32(out int milliseconds) &&
+                                milliseconds >= 0 ? milliseconds : null;
+                            onSentence!(new(content.Trim(), end));
+                        }
+                    }
                     break;
                 case "task-finished":
                     if (!finishing.IsCompleted) throw new ServiceException("百炼任务在提交前结束。");
-                    return JoinSentences(sentences.Values);
+                    return sentences is null ? "" : JoinSentences(sentences.Values);
             }
         }
     }
@@ -193,13 +235,13 @@ public sealed class BailianClient
 
     private static bool IsEastAsian(char ch) => ch is >= '\u2E80' and <= '\u9FFF' or >= '\uAC00' and <= '\uD7AF' or >= '\uFF00' and <= '\uFFEF';
 
-    private static bool Property(JsonElement element, string name, out JsonElement child)
+    internal static bool Property(JsonElement element, string name, out JsonElement child)
     {
         child = default;
         return element.ValueKind == JsonValueKind.Object && element.TryGetProperty(name, out child);
     }
 
-    private static bool Text(JsonElement element, string name, out string value)
+    internal static bool Text(JsonElement element, string name, out string value)
     {
         value = "";
         if (!Property(element, name, out var child) || child.ValueKind != JsonValueKind.String) return false;
@@ -209,7 +251,7 @@ public sealed class BailianClient
 
     private static bool True(JsonElement element, string name) => Property(element, name, out var child) && child.ValueKind == JsonValueKind.True;
 
-    private static string SafeCode(string code) => code.Length is > 0 and <= 64 &&
+    internal static string SafeCode(string code) => code.Length is > 0 and <= 64 &&
         code.All(ch => char.IsAsciiLetterOrDigit(ch) || ch is '-' or '_') ? code : "未知错误";
 
     private static async Task ObserveAsync(Task? task)

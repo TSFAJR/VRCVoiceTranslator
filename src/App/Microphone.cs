@@ -8,6 +8,18 @@ namespace VrcTranslator.Desktop;
 internal sealed record CaptureDevice(string? Id, string Name)
 {
     public override string ToString() => Name;
+    public static List<CaptureDevice> PlaybackDevices() => Active(DataFlow.Render, "Windows 默认播放设备");
+
+    public static List<CaptureDevice> Active(DataFlow flow, string defaultName)
+    {
+        using var devices = new MMDeviceEnumerator();
+        var list = new List<CaptureDevice> { new(null, defaultName) };
+        foreach (var device in devices.EnumerateAudioEndPoints(flow, DeviceState.Active))
+        {
+            using (device) list.Add(new(device.ID, device.FriendlyName));
+        }
+        return list;
+    }
 }
 
 internal sealed class Microphone : IDisposable
@@ -56,16 +68,7 @@ internal sealed class Microphone : IDisposable
         enumerator.Dispose();
     }
 
-    public static List<CaptureDevice> Devices()
-    {
-        using var devices = new MMDeviceEnumerator();
-        var list = new List<CaptureDevice> { new(null, "Windows 默认麦克风") };
-        foreach (var device in devices.EnumerateAudioEndPoints(DataFlow.Capture, DeviceState.Active))
-        {
-            using (device) list.Add(new(device.ID, device.FriendlyName));
-        }
-        return list;
-    }
+    public static List<CaptureDevice> Devices() => CaptureDevice.Active(DataFlow.Capture, "Windows 默认麦克风");
 
     public static int Peak(byte[] buffer, int length)
     {

@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Net.WebSockets;
@@ -15,12 +16,21 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Message ASR startup buffer, streaming, final events", AsrStreaming),
     ("Message ASR blank and auto language", AsrBlank),
     ("Message ASR startup / final timeout and service failure", AsrErrors),
+    ("Incoming ASR emits each final sentence before finish", IncomingAsrEvents),
+    ("Incoming speech keeps the lead, closes on silence and resumes", IncomingSilenceAndResume),
+    ("Incoming filtering ignores noise spikes and rolls over continuous sound", IncomingNoiseAndLimit),
+    ("Incoming speech drops queued older sentences and late results after stop", IncomingQueueAndStop),
     ("DeepL parallel target requests and configured order", DeepLOrdering),
     ("DeepL shared deadline, partial failure and ignored late response", DeepLDeadline),
     ("DeepL total failure and auto language filtering", DeepLFallback),
+    ("TTS WebSocket modes, event sequence and streaming PCM", TtsProtocol),
+    ("TTS service failure, timeout and discarded late PCM", TtsErrorsAndCancel),
+    ("Original TTS precedes and survives DeepL failure", SpeechOriginalParallel),
+    ("Translated TTS starts on target completion and reports skips", SpeechTranslationSelection),
     ("Chatbox sample via real UDP and Unicode clipping", ChatboxPacket),
     ("Manual Chatbox text preserves line breaks and room for translations", ManualChatboxPacket),
     ("Subtitle replacement, new expiry and empty translation", SubtitleTiming),
+    ("Outgoing subtitle takes priority and expired incoming stays hidden", IncomingSubtitleTiming),
     ("Settings defaults, save, external edit and malformed preservation", ConfigRoundTrip)
 };
 int failures = 0;
@@ -148,6 +158,8 @@ static async Task AsrStreaming()
     Equal("zh", parameters.GetProperty("language_hints")[0].GetString());
     True(!parameters.GetProperty("intermediate_result_enabled").GetBoolean());
     True(!parameters.GetProperty("disfluency_removal_enabled").GetBoolean());
+    True(!parameters.TryGetProperty("max_sentence_silence", out _));
+    True(!parameters.TryGetProperty("speech_noise_threshold", out _));
     await Task.Delay(60);
     True(!socket.HasOutgoing);
     socket.Event("task-started", id, split: true);
@@ -209,6 +221,193 @@ static async Task AsrErrors()
     _ = await unfinished.SentText();
     cancel.Cancel();
     _ = await ThrowsAsync<OperationCanceledException>(() => work);
+}
+
+static async Task IncomingAsrEvents()
+{
+    using var socket = new FakeSocket();
+    using var stop = new CancellationTokenSource();
+    var pcm = Channel.CreateUnbounded<byte[]>();
+    var results = Channel.CreateUnbounded<RecognizedSentence>();
+    var asr = new BailianClient((_, _) => Task.FromResult<WebSocket>(socket));
+    var work = asr.StreamSentencesAsync(CloudSettings(), pcm.Reader.ReadAllAsync(),
+        sentence => results.Writer.TryWrite(sentence), stop.Token);
+    string id = await socket.TaskId();
+    socket.Event("task-started", id);
+    socket.Sentence(id, 1, "intermediate", end: false);
+    socket.Sentence(id, 7, "heartbeat", end: true, heartbeat: true);
+    socket.Sentence(id, 1, "First sentence", end: true, endTime: 530);
+    socket.Sentence(id, 1, "Duplicate", end: true);
+    socket.Sentence(id, 3, "Second sentence", end: true);
+    socket.Sentence(id, 2, "Stale final", end: true);
+    Equal(new RecognizedSentence("First sentence", 530), await results.Reader.ReadAsync());
+    Equal(new RecognizedSentence("Second sentence", null), await results.Reader.ReadAsync());
+    True(!work.IsCompleted && !socket.HasOutgoing && !results.Reader.TryRead(out _));
+    stop.Cancel();
+    _ = await ThrowsAsync<OperationCanceledException>(() => work);
+}
+
+static async Task IncomingSilenceAndResume()
+{
+    using var first = new FakeSocket();
+    using var second = new FakeSocket();
+    using var stop = new CancellationTokenSource();
+    using var http = FakeHttp(async (request, token) =>
+    {
+        using var json = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(token));
+        Equal("ZH-HANS", json.RootElement.GetProperty("target_lang").GetString());
+        True(!json.RootElement.TryGetProperty("source_lang", out _));
+        return TranslationResponse("JA", "你好！");
+    });
+    int connections = 0;
+    var asr = new BailianClient((_, _) => Task.FromResult<WebSocket>(Interlocked.Increment(ref connections) == 1 ? first : second));
+    var logs = new List<string>();
+    var speech = new IncomingSpeech(CloudSettings(), asr, new DeepLClient(http), logs.Add);
+    var feed = new IncomingAudio();
+    var work = speech.RunAsync(feed, stop.Token);
+    var quiet = PcmFrame(35);
+    var audible = PcmFrame(2000);
+    for (int i = 0; i < 20; i++) feed.Push(quiet, Stopwatch.GetTimestamp());
+    True(!first.HasOutgoing);
+    PushIncomingFrames(feed, audible, 3);
+    using var run = JsonDocument.Parse(await first.SentText());
+    string id = run.RootElement.GetProperty("header").GetProperty("task_id").GetString()!;
+    var parameters = run.RootElement.GetProperty("payload").GetProperty("parameters");
+    True(!parameters.TryGetProperty("language_hints", out _));
+    Equal(500, parameters.GetProperty("max_sentence_silence").GetInt32());
+    True(!parameters.TryGetProperty("speech_noise_threshold", out _));
+    first.Event("task-started", id);
+    string quietPacket = Convert.ToHexString(quiet.Concat(quiet).Concat(quiet).Concat(quiet).Concat(quiet).ToArray());
+    for (int i = 0; i < 3; i++) Equal((WebSocketMessageType.Binary, quietPacket), await first.SentHex());
+    first.Sentence(id, 1, "こんにちは！", end: true, endTime: 320);
+    IncomingTranslation? translated = null;
+    while ((translated = speech.TakeLatest()) is null) await Task.Delay(10);
+    Equal("你好！", translated.Text);
+    True(logs.Single().StartsWith("来话句末至识别"));
+    for (int i = 0; i < 250; i++) feed.Push(quiet, Stopwatch.GetTimestamp());
+    byte[] lastVoice = [.. audible, .. audible, .. audible, .. quiet, .. quiet];
+    Equal((WebSocketMessageType.Binary, Convert.ToHexString(lastVoice)), await first.SentHex());
+    Equal((WebSocketMessageType.Binary, quietPacket), await first.SentHex());
+    byte[] filteredTail = [.. quiet, .. new byte[4 * IncomingAudio.FrameBytes]];
+    True((await first.SentHex()) == (WebSocketMessageType.Binary, Convert.ToHexString(filteredTail)));
+    await FinishIncoming(first, id);
+    for (int i = 0; i < 10; i++) feed.Push(quiet, Stopwatch.GetTimestamp());
+    PushIncomingFrames(feed, audible, 3);
+    string nextId = await second.TaskId();
+    True(nextId != id);
+    Equal(2, connections);
+    second.Event("task-started", nextId);
+    // The Windows endpoint can stop delivering packets during a natural pause.
+    True(await FinishIncoming(second, nextId).WaitAsync(TimeSpan.FromSeconds(3)) > 0);
+    stop.Cancel();
+    _ = await ThrowsAsync<OperationCanceledException>(() => work);
+}
+
+static async Task IncomingNoiseAndLimit()
+{
+    using var first = new FakeSocket();
+    using var second = new FakeSocket();
+    using var stop = new CancellationTokenSource();
+    using var http = FakeHttp((_, _) => throw new InvalidOperationException("Blank ASR should not translate."));
+    int connections = 0;
+    var asr = new BailianClient((_, _) => Task.FromResult<WebSocket>(Interlocked.Increment(ref connections) == 1 ? first : second));
+    var speech = new IncomingSpeech(CloudSettings() with { IncomingStrongerNoiseFilter = true }, asr, new DeepLClient(http), _ => { });
+    var feed = new IncomingAudio(strongerNoiseFilter: true);
+    var work = speech.RunAsync(feed, stop.Token);
+    var noise = PcmFrame(180);
+    var voice = PcmFrame(3000);
+    PushIncomingFrames(feed, noise, 20);
+    PushIncomingFrames(feed, voice, 2);
+    PushIncomingFrames(feed, noise, 2);
+    await Task.Delay(30);
+    Equal(0, Volatile.Read(ref connections));
+
+    PushIncomingFrames(feed, voice, 3);
+    using var run = JsonDocument.Parse(await first.SentText());
+    string id = run.RootElement.GetProperty("header").GetProperty("task_id").GetString()!;
+    Equal(0.1, run.RootElement.GetProperty("payload").GetProperty("parameters").GetProperty("speech_noise_threshold").GetDouble());
+    first.Event("task-started", id);
+    PushIncomingFrames(feed, voice, 482);
+    Equal(500 * IncomingAudio.FrameBytes, await FinishIncoming(first, id));
+    PushIncomingFrames(feed, voice, 3);
+    True(await second.TaskId() != id);
+    True(speech.Status.Contains("未识别到完整语句"));
+    stop.Cancel();
+    _ = await ThrowsAsync<OperationCanceledException>(() => work);
+}
+
+static async Task IncomingQueueAndStop()
+{
+    using var first = new FakeSocket();
+    using var second = new FakeSocket();
+    using var stop = new CancellationTokenSource();
+    var requests = Channel.CreateUnbounded<string>();
+    var slow = new TaskCompletionSource<HttpResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+    var late = new TaskCompletionSource<HttpResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+    using var http = FakeHttp(async (request, token) =>
+    {
+        using var json = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(token));
+        string text = json.RootElement.GetProperty("text")[0].GetString()!;
+        requests.Writer.TryWrite(text);
+        return await (text == "First" ? slow : late).Task;
+    });
+    int connections = 0;
+    var asr = new BailianClient((_, _) => Task.FromResult<WebSocket>(++connections == 1 ? first : second));
+    var speech = new IncomingSpeech(CloudSettings(), asr, new DeepLClient(http), _ => { });
+    var feed = new IncomingAudio();
+    var work = speech.RunAsync(feed, stop.Token);
+    PushIncomingFrames(feed, PcmFrame(2000), 3);
+    string id = await first.TaskId();
+    first.Event("task-started", id);
+    first.Sentence(id, 1, "First", end: true);
+    Equal("First", await requests.Reader.ReadAsync());
+    first.Sentence(id, 2, "Old pending", end: true);
+    first.Sentence(id, 3, "Newest", end: true);
+    var quiet = PcmFrame(0);
+    for (int i = 0; i < 250; i++) feed.Push(quiet, Stopwatch.GetTimestamp());
+    await FinishIncoming(first, id);
+    PushIncomingFrames(feed, PcmFrame(2000), 3);
+    _ = await second.TaskId();
+    slow.SetResult(TranslationResponse("EN", "第一句"));
+    Equal("Newest", await requests.Reader.ReadAsync());
+    Equal("第一句", speech.TakeLatest()?.Text);
+    stop.Cancel();
+    _ = await ThrowsAsync<OperationCanceledException>(() => work);
+    late.SetResult(TranslationResponse("EN", "迟到的译文"));
+    Equal<IncomingTranslation?>(null, speech.TakeLatest());
+    True(!requests.Reader.TryRead(out _));
+}
+
+static void PushIncomingFrames(IncomingAudio feed, byte[] pcm, int count)
+{
+    for (int i = 0; i < count; i++) feed.Push(pcm, Stopwatch.GetTimestamp());
+}
+
+static byte[] PcmFrame(short sample)
+{
+    var data = new byte[IncomingAudio.FrameBytes];
+    for (int i = 0; i < data.Length; i += sizeof(short))
+    {
+        data[i] = (byte)sample;
+        data[i + 1] = (byte)(sample >> 8);
+    }
+    return data;
+}
+
+static async Task<int> FinishIncoming(FakeSocket socket, string id)
+{
+    int bytes = 0;
+    while (true)
+    {
+        var (type, hex) = await socket.SentHex();
+        if (type == WebSocketMessageType.Binary) { bytes += hex.Length / 2; continue; }
+        using var json = JsonDocument.Parse(Convert.FromHexString(hex));
+        var header = json.RootElement.GetProperty("header");
+        Equal("finish-task", header.GetProperty("action").GetString());
+        Equal(id, header.GetProperty("task_id").GetString());
+        socket.Event("task-finished", id);
+        return bytes;
+    }
 }
 
 static async Task DeepLOrdering()
@@ -275,6 +474,150 @@ static async Task DeepLFallback()
     Equal(1, batch.Errors.Count);
     True(batch.Errors[0].Contains("456"));
     Equal("original", Chatbox.Format(new("original", batch.Results)));
+}
+
+static async Task TtsProtocol()
+{
+    foreach (var (mode, voice, lang) in new[]
+    {
+        (SpeechMode.ChineseOriginal, SpeechSettings.DefaultCustomVoice, "zh"),
+        (SpeechMode.EnglishTranslation, "custom-english", "en"),
+        (SpeechMode.JapaneseTranslation, SpeechSettings.DefaultJapaneseVoice, "ja")
+    })
+    {
+        using var socket = new FakeSocket();
+        var blocks = Channel.CreateUnbounded<byte[]>();
+        var options = new SpeechSettings { Mode = mode, EnglishVoice = "custom-english" };
+        string original = options.SelectMode().SampleText + new string('語', 170);
+        var tts = new BailianTtsClient((_, _) => Task.FromResult<WebSocket>(socket));
+        var work = tts.SynthesizeAsync(original, CloudSettings() with { Speech = options },
+            (pcm, token) => blocks.Writer.WriteAsync(pcm.ToArray(), token), CancellationToken.None);
+        using var run = JsonDocument.Parse(await socket.SentText());
+        var header = run.RootElement.GetProperty("header");
+        var payload = run.RootElement.GetProperty("payload");
+        var parameters = payload.GetProperty("parameters");
+        string id = header.GetProperty("task_id").GetString()!;
+        True(Guid.TryParse(id, out _));
+        Equal("run-task", header.GetProperty("action").GetString());
+        Equal("duplex", header.GetProperty("streaming").GetString());
+        Equal("audio", payload.GetProperty("task_group").GetString());
+        Equal("tts", payload.GetProperty("task").GetString());
+        Equal("SpeechSynthesizer", payload.GetProperty("function").GetString());
+        Equal(BailianTtsClient.Model, payload.GetProperty("model").GetString());
+        Equal("PlainText", parameters.GetProperty("text_type").GetString());
+        Equal("pcm", parameters.GetProperty("format").GetString());
+        Equal(24000, parameters.GetProperty("sample_rate").GetInt32());
+        Equal(voice, parameters.GetProperty("voice").GetString());
+        Equal(lang, parameters.GetProperty("language_hints")[0].GetString());
+        socket.Event("task-started", "another-task");
+        True(!socket.HasOutgoing);
+        socket.Event("task-started", id, split: true);
+        await CheckTtsSend(socket, id, original);
+
+        socket.Binary([1, 2, 3]);
+        Equal("0102", Convert.ToHexString(await blocks.Reader.ReadAsync()));
+        True(!work.IsCompleted);
+        socket.Event("result-generated", id);
+        socket.Binary([4, 5, 6]);
+        Equal("03040506", Convert.ToHexString(await blocks.Reader.ReadAsync()));
+        socket.Event("task-finished", id);
+        await work;
+    }
+}
+
+static async Task CheckTtsSend(FakeSocket socket, string id, string text)
+{
+    using var next = JsonDocument.Parse(await socket.SentText());
+    Equal("continue-task", next.RootElement.GetProperty("header").GetProperty("action").GetString());
+    Equal(id, next.RootElement.GetProperty("header").GetProperty("task_id").GetString());
+    Equal(text, next.RootElement.GetProperty("payload").GetProperty("input").GetProperty("text").GetString());
+    using var finish = JsonDocument.Parse(await socket.SentText());
+    Equal("finish-task", finish.RootElement.GetProperty("header").GetProperty("action").GetString());
+    Equal(id, finish.RootElement.GetProperty("header").GetProperty("task_id").GetString());
+    True(!finish.RootElement.GetProperty("payload").GetProperty("input").EnumerateObject().Any());
+}
+
+static async Task TtsErrorsAndCancel()
+{
+    using var failed = new FakeSocket();
+    var tts = new BailianTtsClient((_, _) => Task.FromResult<WebSocket>(failed));
+    var work = tts.SynthesizeAsync("sample", CloudSettings(), (_, _) => ValueTask.CompletedTask, CancellationToken.None);
+    string id = await failed.TaskId();
+    failed.Event("task-failed", id, code: "InvalidVoice", detail: "voice does not exist");
+    var error = await ThrowsAsync<ServiceException>(() => work);
+    True(error.Message.Contains("InvalidVoice") && error.Message.Contains("音色 ID"));
+
+    using var timeout = new FakeSocket();
+    tts = new((_, _) => Task.FromResult<WebSocket>(timeout), responseTimeout: TimeSpan.FromMilliseconds(200));
+    work = tts.SynthesizeAsync("sample", CloudSettings(), (_, _) => ValueTask.CompletedTask, CancellationToken.None);
+    id = await timeout.TaskId();
+    timeout.Event("task-started", id);
+    await CheckTtsSend(timeout, id, "sample");
+    True((await ThrowsAsync<ServiceException>(() => work)).Message.Contains("超时"));
+
+    using var late = new FakeSocket(ignoreReceiveCancellation: true);
+    using var stop = new CancellationTokenSource();
+    var packets = Channel.CreateUnbounded<byte[]>();
+    tts = new((_, _) => Task.FromResult<WebSocket>(late));
+    work = tts.SynthesizeAsync("sample", CloudSettings(), (pcm, token) => packets.Writer.WriteAsync(pcm.ToArray(), token), stop.Token);
+    id = await late.TaskId();
+    late.Event("task-started", id);
+    await CheckTtsSend(late, id, "sample");
+    late.Binary([10, 20]);
+    _ = await packets.Reader.ReadAsync();
+    stop.Cancel();
+    late.Binary([30, 40]);
+    _ = await ThrowsAsync<OperationCanceledException>(() => work);
+    True(!packets.Reader.TryRead(out _));
+    Equal(WebSocketState.Aborted, late.State);
+}
+
+static async Task SpeechOriginalParallel()
+{
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+    var blocked = new TaskCompletionSource<HttpResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+    using var http = FakeHttp((_, token) => blocked.Task.WaitAsync(token));
+    var speech = Channel.CreateUnbounded<SpeechSelection>();
+    var settings = CloudSettings() with { Speech = new() { Enabled = true } };
+    string fullText = new('中', 200);
+    var work = TakeTranslation.TranslateAsync(new(http), fullText, settings, selection => speech.Writer.TryWrite(selection), timeout.Token);
+    Equal(new SpeechSelection(fullText, null), await speech.Reader.ReadAsync(timeout.Token));
+    True(!work.IsCompleted);
+    blocked.SetResult(new(HttpStatusCode.Forbidden));
+    var result = await work;
+    Equal(0, result.Results.Count);
+    True(!speech.Reader.TryRead(out _));
+    _ = await TakeTranslation.TranslateAsync(new(http), fullText, settings with { Speech = new() },
+        _ => throw new InvalidOperationException("Disabled speech published"), timeout.Token);
+}
+
+static async Task SpeechTranslationSelection()
+{
+    using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+    var slow = new TaskCompletionSource<HttpResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+    string fullText = new('e', 200);
+    using var http = FakeHttp(async (request, token) =>
+    {
+        using var json = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(token));
+        return json.RootElement.GetProperty("target_lang").GetString() == "EN-US"
+            ? TranslationResponse("ZH", fullText) : await slow.Task.WaitAsync(token);
+    });
+    var selected = Channel.CreateUnbounded<SpeechSelection>();
+    var settings = CloudSettings() with { Speech = new() { Enabled = true, Mode = SpeechMode.EnglishTranslation } };
+    var work = TakeTranslation.TranslateAsync(new(http), "原文", settings, value => selected.Writer.TryWrite(value), timeout.Token);
+    Equal(new SpeechSelection(fullText, null), await selected.Reader.ReadAsync(timeout.Token));
+    True(!work.IsCompleted);
+    slow.SetResult(new(HttpStatusCode.Forbidden));
+    Equal("EN-US", (await work).Results.Single().Language);
+    True(!selected.Reader.TryRead(out _));
+
+    var japanese = settings with { Speech = settings.Speech with { Mode = SpeechMode.JapaneseTranslation } };
+    await TakeTranslation.TranslateAsync(new(http), "原文", japanese, value => selected.Writer.TryWrite(value), timeout.Token);
+    True((await selected.Reader.ReadAsync(timeout.Token)).SkipReason!.Contains("403"));
+    await TakeTranslation.TranslateAsync(new(http), "原文", japanese with { TargetLanguages = ["EN-US"] },
+        value => selected.Writer.TryWrite(value), timeout.Token);
+    True((await selected.Reader.ReadAsync(timeout.Token)).SkipReason!.Contains("未配置 JA"));
+    True(!selected.Reader.TryRead(out _));
 }
 
 static async Task ChatboxPacket()
@@ -361,6 +704,31 @@ static Task SubtitleTiming()
     return Task.CompletedTask;
 }
 
+static Task IncomingSubtitleTiming()
+{
+    var subtitles = new SubtitlePresentation();
+    var settings = new SubtitleSettings { ShowOriginal = true };
+    subtitles.Replace(new("自己的原文", [new("EN-US", "My subtitle")]));
+    Equal("自己的原文\nMy subtitle", subtitles.TextAt(TimeSpan.Zero, settings));
+    Equal<long?>(null, subtitles.MarkShown(TimeSpan.Zero, 3));
+    subtitles.ReplaceIncoming("第一句", TimeSpan.FromSeconds(1), 3, 20);
+    subtitles.ReplaceIncoming("最新一句", TimeSpan.FromSeconds(2), 3, 21);
+    Equal("自己的原文\nMy subtitle", subtitles.TextAt(TimeSpan.FromSeconds(2.9), settings));
+    Equal("来话 · 最新一句", subtitles.TextAt(TimeSpan.FromSeconds(3), settings));
+    Equal<long?>(21, subtitles.MarkShown(TimeSpan.FromSeconds(3), 3));
+    Equal<long?>(null, subtitles.MarkShown(TimeSpan.FromSeconds(4), 3));
+    Equal<string?>(null, subtitles.TextAt(TimeSpan.FromSeconds(5), settings));
+
+    subtitles.Replace(new("原文", [new("EN-US", "Longer subtitle")]));
+    subtitles.MarkShown(TimeSpan.FromSeconds(6), 3);
+    subtitles.ReplaceIncoming("已过期", TimeSpan.FromSeconds(6), 2, 22);
+    Equal<string?>(null, subtitles.TextAt(TimeSpan.FromSeconds(9), settings));
+    subtitles.ReplaceIncoming("被清除", TimeSpan.FromSeconds(10), 3, 23);
+    subtitles.ClearIncoming();
+    Equal<string?>(null, subtitles.TextAt(TimeSpan.FromSeconds(11), settings));
+    return Task.CompletedTask;
+}
+
 static Task ConfigRoundTrip()
 {
     string directory = Path.Combine(Path.GetTempPath(), "vrc-tests-" + Guid.NewGuid().ToString("N"));
@@ -370,6 +738,16 @@ static Task ConfigRoundTrip()
         Equal("", store.Load().BailianApiKey);
         var settings = store.Load();
         Equal("", settings.DeepLApiKey);
+        True(!settings.Speech.Enabled);
+        Equal(SpeechMode.ChineseOriginal, settings.Speech.Mode);
+        Equal(SpeechSettings.DefaultCustomVoice, settings.Speech.ChineseVoice);
+        Equal(SpeechSettings.DefaultCustomVoice, settings.Speech.EnglishVoice);
+        Equal(SpeechSettings.DefaultJapaneseVoice, settings.Speech.JapaneseVoice);
+        Equal<string?>(null, settings.Speech.OutputDeviceId);
+        True(!settings.Speech.MonitorEnabled);
+        Equal<string?>(null, settings.Speech.MonitorDeviceId);
+        Equal<string?>(null, settings.IncomingPlaybackDeviceId);
+        True(!settings.IncomingStrongerNoiseFilter);
         Equal(0x77, settings.KeyboardVirtualKey);
         Equal("EN-US,JA", string.Join(',', settings.TargetLanguages));
         File.WriteAllText(store.Path, """{"oscPort":9010,"subtitles":{"distanceMeters":2.0}}""");
@@ -377,10 +755,19 @@ static Task ConfigRoundTrip()
         Equal(9010, settings.OscPort);
         Equal(3d, settings.Subtitles.DurationSeconds);
         Equal(2d, settings.Subtitles.DistanceMeters);
-        store.Save(settings with { BailianApiKey = "one", DeepLApiKey = "two:fx", TargetLanguages = ["ja", "en-us"] });
+        store.Save(settings with { BailianApiKey = "one", DeepLApiKey = "two:fx", TargetLanguages = ["ja", "en-us"],
+            IncomingPlaybackDeviceId = "example-render-endpoint", IncomingStrongerNoiseFilter = true,
+            Speech = new() { Enabled = true, Mode = SpeechMode.JapaneseTranslation, VolumePercent = 35,
+                ChineseVoice = "  zh-voice  ", EnglishVoice = "en-voice", JapaneseVoice = "ja-voice", OutputDeviceId = "tts-output",
+                MonitorEnabled = true, MonitorDeviceId = "headphones" } });
         string raw = File.ReadAllText(store.Path);
         True(raw.Contains("\"one\"") && raw.Contains("\"two:fx\""));
         Equal("JA,EN-US", string.Join(',', store.Load().TargetLanguages));
+        Equal("example-render-endpoint", store.Load().IncomingPlaybackDeviceId);
+        True(store.Load().IncomingStrongerNoiseFilter);
+        Equal(new SpeechSettings { Enabled = true, Mode = SpeechMode.JapaneseTranslation, VolumePercent = 35,
+            ChineseVoice = "zh-voice", EnglishVoice = "en-voice", JapaneseVoice = "ja-voice", OutputDeviceId = "tts-output",
+            MonitorEnabled = true, MonitorDeviceId = "headphones" }, store.Load().Speech);
         Equal(1, Directory.GetFiles(directory).Length);
         const string bad = "{\"oscPort\":";
         File.WriteAllText(store.Path, bad);
@@ -445,9 +832,10 @@ sealed class FakeHandler(Func<HttpRequestMessage, CancellationToken, Task<HttpRe
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) => send(request, cancellationToken);
 }
 
-sealed class FakeSocket : WebSocket
+sealed class FakeSocket(bool ignoreReceiveCancellation = false) : WebSocket
 {
-    private readonly Channel<(byte[] Bytes, bool End)> fromServer = Channel.CreateUnbounded<(byte[], bool)>();
+    private readonly Channel<(byte[] Bytes, WebSocketMessageType Type, bool End)> fromServer =
+        Channel.CreateUnbounded<(byte[], WebSocketMessageType, bool)>();
     private readonly Channel<(byte[] Bytes, WebSocketMessageType Type)> toServer = Channel.CreateUnbounded<(byte[], WebSocketMessageType)>();
     private WebSocketState state = WebSocketState.Open;
     public bool HasOutgoing => toServer.Reader.TryPeek(out _);
@@ -463,9 +851,9 @@ sealed class FakeSocket : WebSocket
 
     public override async Task<WebSocketReceiveResult> ReceiveAsync(ArraySegment<byte> buffer, CancellationToken cancellationToken)
     {
-        var next = await fromServer.Reader.ReadAsync(cancellationToken);
+        var next = await fromServer.Reader.ReadAsync(ignoreReceiveCancellation ? CancellationToken.None : cancellationToken);
         next.Bytes.CopyTo(buffer.Array!, buffer.Offset);
-        return new(next.Bytes.Length, WebSocketMessageType.Text, next.End);
+        return new(next.Bytes.Length, next.Type, next.End);
     }
 
     public override Task SendAsync(ArraySegment<byte> buffer, WebSocketMessageType messageType, bool endOfMessage, CancellationToken cancellationToken) =>
@@ -490,20 +878,22 @@ sealed class FakeSocket : WebSocket
         return json.RootElement.GetProperty("header").GetProperty("task_id").GetString()!;
     }
 
-    public void Event(string type, string id, bool split = false, string code = "") =>
-        Send(new { header = new { @event = type, task_id = id, error_code = code } }, split);
+    public void Event(string type, string id, bool split = false, string code = "", string detail = "") =>
+        Send(new { header = new { @event = type, task_id = id, error_code = code, error_message = detail } }, split);
 
-    public void Sentence(string id, int number, string text, bool end, bool heartbeat = false) => Send(new
+    public void Binary(byte[] bytes) => fromServer.Writer.TryWrite((bytes, WebSocketMessageType.Binary, true));
+
+    public void Sentence(string id, int number, string text, bool end, bool heartbeat = false, int? endTime = null) => Send(new
     {
         header = new { @event = "result-generated", task_id = id },
-        payload = new { output = new { sentence = new { sentence_id = number, text, sentence_end = end, heartbeat } } }
+        payload = new { output = new { sentence = new { sentence_id = number, text, sentence_end = end, heartbeat, end_time = endTime } } }
     });
 
     private void Send(object message, bool split = false)
     {
         byte[] bytes = JsonSerializer.SerializeToUtf8Bytes(message);
         int middle = bytes.Length / 2;
-        if (split) fromServer.Writer.TryWrite((bytes[..middle], false));
-        fromServer.Writer.TryWrite((split ? bytes[middle..] : bytes, true));
+        if (split) fromServer.Writer.TryWrite((bytes[..middle], WebSocketMessageType.Text, false));
+        fromServer.Writer.TryWrite((split ? bytes[middle..] : bytes, WebSocketMessageType.Text, true));
     }
 }

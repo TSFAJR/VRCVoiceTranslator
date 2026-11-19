@@ -8,7 +8,8 @@ $workspace = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot '..')).Path
 $project = Join-Path $workspace 'src/App/App.csproj'
 [xml]$buildProperties = Get-Content -Raw -LiteralPath (Join-Path $workspace 'Directory.Build.props')
 $version = [string]$buildProperties.Project.PropertyGroup.Version
-if ($version -notmatch '^\d+\.\d+\.\d+$') { throw 'Directory.Build.props must specify a release version.' }
+if ($version -notmatch '^\d+\.\d+\.\d+(?:-rc[1-9]\d*)?$') { throw 'Directory.Build.props must specify a release or release candidate version.' }
+$displayVersion = $version.Replace('-rc', 'rc')
 $output = Join-Path $workspace 'artifacts/release'
 $null = New-Item -ItemType Directory -Force -Path $output
 $output = (Resolve-Path -LiteralPath $output).Path
@@ -28,9 +29,10 @@ try {
     if ($LASTEXITCODE -ne 0) { throw ".NET publish failed ($LASTEXITCODE)." }
     Copy-Item -LiteralPath (Join-Path $workspace 'README.md') -Destination $payload
 
-    $installer = 'VRCVoiceTranslator-Setup-win-x64.exe'
-    $portable = 'VRCVoiceTranslator-Portable-win-x64.zip'
-    & $inno '/Qp' "/DPayloadDir=$payload" "/DAppVersion=$version" "/O$staging" (Join-Path $PSScriptRoot 'VRCVoiceTranslator.iss')
+    $installerBase = "VRCVoiceTranslator-Setup-$displayVersion-win-x64"
+    $installer = "$installerBase.exe"
+    $portable = "VRCVoiceTranslator-Portable-$displayVersion-win-x64.zip"
+    & $inno '/Qp' "/DPayloadDir=$payload" "/DAppVersion=$displayVersion" "/O$staging" "/F$installerBase" (Join-Path $PSScriptRoot 'VRCVoiceTranslator.iss')
     if ($LASTEXITCODE -ne 0) { throw "Inno Setup compilation failed ($LASTEXITCODE)." }
     Compress-Archive -Path (Join-Path $payload '*') -DestinationPath (Join-Path $staging $portable) -CompressionLevel Optimal
     foreach ($file in @($installer, $portable)) {

@@ -8,6 +8,10 @@ namespace VrcTranslator.Desktop;
 internal sealed record DesktopStatus(VoicePhase Phase, string Vr, string Error, string ChatboxState, string ChatboxText, VrStatus Binding = default)
 {
     public bool SteamVrConnected => Binding.Connected;
+    public bool IncomingActive { get; init; }
+    public string IncomingStatus { get; init; } = "已关闭";
+    public bool SpeechActive { get; init; }
+    public string SpeechStatus { get; init; } = "待机";
 }
 
 internal sealed partial class DesktopRuntime : IDisposable
@@ -22,6 +26,7 @@ internal sealed partial class DesktopRuntime : IDisposable
     private readonly TriggerGate gate = new();
     private readonly SubtitlePresentation subtitles = new();
     private readonly BailianClient asr = new();
+    private readonly BailianTtsClient tts = new();
     private readonly HttpClient http = new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = Timeout.InfiniteTimeSpan };
     private readonly DeepLClient translate;
     private readonly ActivityLog log;
@@ -34,9 +39,13 @@ internal sealed partial class DesktopRuntime : IDisposable
     private bool wasPreviewing;
     private string? lastOverlayError;
     private RecordingSession? active;
+    private SpeechPlayback? playback;
+    private long speechGeneration;
     private DesktopStatus status = new(VoicePhase.Idle, "等待 SteamVR", "", "", "");
     private Task? micTest;
     private CancellationTokenSource? micTestStop;
+    private IncomingListener? incoming;
+    private IncomingListener? stoppingIncoming;
     private int meter;
 
     public DesktopRuntime(Settings initial, ActivityLog log)
@@ -53,11 +62,27 @@ internal sealed partial class DesktopRuntime : IDisposable
     public DesktopStatus Status => Volatile.Read(ref status);
     public int Meter => Volatile.Read(ref meter);
     public bool MicTestActive => Volatile.Read(ref micTest) is { IsCompleted: false };
-    public void Apply(Settings value) => Volatile.Write(ref settings, value);
+    public void Apply(Settings value)
+    {
+        var previous = Interlocked.Exchange(ref settings, value);
+        if (previous.Speech.Enabled && !value.Speech.Enabled) controls.Enqueue(() => InterruptSpeech("自动播报已关闭"));
+    }
     public void Preview(SubtitleSettings? value) => Volatile.Write(ref preview, value);
     public void SetKeyboardPaused(bool paused) => Volatile.Write(ref keyboardPaused, paused);
     public void OpenBindings() => controls.Enqueue(vr.OpenBindings);
     public void StopMicTest() => controls.Enqueue(StopTest);
+    public void StopSpeech() => controls.Enqueue(() => InterruptSpeech("已停止"));
+    public void PreviewSpeech(SpeechSettings options) => controls.Enqueue(() =>
+    {
+        if (gate.Capturing) { SetSpeechStatus("请在本次录音结束后试听", false); return; }
+        InterruptSpeech();
+        StartSpeech(options.SelectMode().SampleText, Current with { Speech = options }, Stopwatch.GetTimestamp());
+    });
+    public void SetIncoming(bool enabled, string? playbackDeviceId, bool strongerNoiseFilter) => controls.Enqueue(() =>
+    {
+        if (enabled) StartIncoming(playbackDeviceId, strongerNoiseFilter);
+        else StopIncoming("已关闭");
+    });
 
     public void TestChatbox(int port) => controls.Enqueue(() => SendChatbox(() => Chatbox.Format(Chatbox.Example), port));
 
@@ -66,10 +91,15 @@ internal sealed partial class DesktopRuntime : IDisposable
         string original = Chatbox.NormalizeManualText(text);
         if (original.Length == 0) return false;
         var cancellation = exiting.Token;
+        var snapshot = Current;
         TranslationBatch batch;
         try
         {
-            batch = await translate.TranslateAsync(original, Current, cancellation).ConfigureAwait(false);
+            long? generation = snapshot.Speech.Enabled ? await ReserveManualSpeechAsync(cancellation).ConfigureAwait(false) : null;
+            batch = generation is { } ticket
+                ? await TakeTranslation.TranslateAsync(translate, original, snapshot,
+                    selection => QueueSpeech(selection, snapshot, ticket), cancellation).ConfigureAwait(false)
+                : await translate.TranslateAsync(original, snapshot, cancellation).ConfigureAwait(false);
         }
         catch (Exception error) when (error is not OperationCanceledException)
         {
@@ -90,6 +120,22 @@ internal sealed partial class DesktopRuntime : IDisposable
             result.SetResult(SendChatbox(() => Chatbox.FormatManual(original, batch.Results), port));
         });
         return await result.Task.WaitAsync(cancellation).ConfigureAwait(false);
+    }
+
+    private Task<long?> ReserveManualSpeechAsync(CancellationToken cancellation)
+    {
+        var reservation = new TaskCompletionSource<long?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        controls.Enqueue(() =>
+        {
+            if (gate.Capturing || cancellation.IsCancellationRequested || !Current.Speech.Enabled)
+            {
+                reservation.SetResult(null);
+                return;
+            }
+            InterruptSpeech();
+            reservation.SetResult(speechGeneration);
+        });
+        return reservation.Task.WaitAsync(cancellation);
     }
 
     public void TestMicrophone(string? deviceId) => controls.Enqueue(() =>
@@ -135,9 +181,13 @@ internal sealed partial class DesktopRuntime : IDisposable
         finally
         {
             StopTest();
+            InterruptSpeech();
+            StopIncoming("已关闭");
             active?.Cancel();
             WaitForShutdown(micTest);
             WaitForShutdown(active?.Work);
+            WaitForShutdown(stoppingIncoming?.Work);
+            stoppingIncoming?.Dispose();
             active?.Dispose();
             micTestStop?.Dispose();
             vr.Dispose();
@@ -165,8 +215,11 @@ internal sealed partial class DesktopRuntime : IDisposable
         {
             case TriggerCommand.Start:
                 StopTest();
+                InterruptSpeech();
+                long generation = speechGeneration;
                 SetStatus(s => s with { Error = "" });
-                active = new RecordingSession(inputSettings, asr, translate, log.Write);
+                active = new RecordingSession(inputSettings, asr, translate, log.Write,
+                    selection => QueueSpeech(selection, inputSettings, generation));
                 log.Write(gate.Owner == TriggerSource.Vr ? "手柄触发录音。" : "键盘触发录音。");
                 break;
             case TriggerCommand.Submit:
@@ -180,11 +233,166 @@ internal sealed partial class DesktopRuntime : IDisposable
         }
 
         if (active is { Work.IsCompleted: true }) CompleteTake(current);
+        UpdateSpeech();
+        UpdateIncoming(current.Subtitles, vrStatus.Connected);
         UpdateOverlay(current.Subtitles, vrStatus.Connected);
         var phase = active?.Phase ?? VoicePhase.Idle;
         if (status.Phase != phase && phase == VoicePhase.Idle) log.Write("已恢复待机。");
         if (status.Phase != phase || status.Vr != vrText || status.Binding != vrStatus)
             SetStatus(s => s with { Phase = phase, Vr = vrText, Binding = vrStatus });
+    }
+
+    private void QueueSpeech(SpeechSelection selection, Settings snapshot, long generation)
+    {
+        long readyAt = Stopwatch.GetTimestamp();
+        controls.Enqueue(() =>
+        {
+            if (generation != speechGeneration || !Current.Speech.Enabled) return;
+            if (selection.Text is { } text) StartSpeech(text, snapshot, readyAt);
+            else if (selection.SkipReason is { } reason)
+            {
+                SetSpeechStatus(reason, false);
+                log.Write(reason);
+            }
+        });
+    }
+
+    private void StartSpeech(string text, Settings snapshot, long readyAt)
+    {
+        playback = new SpeechPlayback(tts, text, snapshot, readyAt, log.Write);
+        SetSpeechStatus("正在合成", true);
+    }
+
+    private void InterruptSpeech(string? state = null)
+    {
+        speechGeneration++;
+        if (playback is { } previous)
+        {
+            playback = null;
+            previous.Stop();
+            _ = DisposeInterruptedAsync(previous);
+            state ??= "已停止";
+        }
+        if (state is not null) SetSpeechStatus(state, false);
+    }
+
+    private static async Task DisposeInterruptedAsync(SpeechPlayback previous)
+    {
+        using (previous)
+        {
+            try { await previous.Work.ConfigureAwait(false); }
+            catch (Exception) { /* Interrupted jobs no longer publish status or audio. */ }
+        }
+    }
+
+    private void UpdateSpeech()
+    {
+        if (playback is not { } job) return;
+        if (!job.Work.IsCompleted) { SetSpeechStatus(job.Status, true); return; }
+        playback = null;
+        using (job)
+        {
+            try
+            {
+                job.Work.GetAwaiter().GetResult();
+                SetSpeechStatus(job.CompletionStatus, false);
+            }
+            catch (Exception error)
+            {
+                string reason = error is ServiceException ? error.Message : $"{error.GetType().Name} / 0x{error.HResult:X8}";
+                SetSpeechStatus($"播报失败 · {reason}", false);
+                log.Write($"语音播报：{reason}");
+            }
+        }
+    }
+
+    private void SetSpeechStatus(string detail, bool enabled)
+    {
+        if (status.SpeechActive != enabled || status.SpeechStatus != detail)
+            SetStatus(s => s with { SpeechActive = enabled, SpeechStatus = detail });
+    }
+
+    private void StartIncoming(string? playbackDeviceId, bool strongerNoiseFilter)
+    {
+        if (incoming is not null) return;
+        ReapStoppedIncoming();
+        if (stoppingIncoming is { Work.IsCompleted: false })
+        {
+            SetIncomingStatus(false, "正在停止，请稍后开启");
+            return;
+        }
+        try
+        {
+            var current = Current with { IncomingPlaybackDeviceId = playbackDeviceId, IncomingStrongerNoiseFilter = strongerNoiseFilter };
+            incoming = IncomingListener.Start(current, asr, translate, log.Write);
+            SetIncomingStatus(true, "正在启动");
+            log.Write("已开启来话翻译。");
+        }
+        catch (Exception error) { SetIncomingError(error); }
+    }
+
+    private void StopIncoming(string reason)
+    {
+        if (incoming is not { } listener) return;
+        stoppingIncoming = listener;
+        incoming = null;
+        subtitles.ClearIncoming();
+        listener.Stop();
+        SetIncomingStatus(false, reason);
+        log.Write($"已停止来话翻译（{reason}）。");
+    }
+
+    private void ReapStoppedIncoming()
+    {
+        if (stoppingIncoming is { Work.IsCompleted: true } retired)
+        {
+            WaitForShutdown(retired.Work);
+            retired.Dispose();
+            stoppingIncoming = null;
+            if (status.IncomingStatus == "正在停止，请稍后开启") SetIncomingStatus(false, "已关闭");
+        }
+    }
+
+    private void UpdateIncoming(SubtitleSettings current, bool connected)
+    {
+        ReapStoppedIncoming();
+        if (incoming is not { } listener) return;
+        if (listener.Work.IsCompleted)
+        {
+            try
+            {
+                listener.Work.GetAwaiter().GetResult();
+                StopIncoming("已关闭 · VRChat 已退出");
+            }
+            catch (Exception error)
+            {
+                StopIncoming("已关闭");
+                SetIncomingError(error);
+            }
+            return;
+        }
+        if (!current.Enabled) { StopIncoming("已关闭 · 头显字幕已停用"); return; }
+
+        string detail = listener.Status;
+        if (!connected) detail += " · SteamVR 未连接";
+        SetIncomingStatus(true, detail);
+        var translation = listener.TakeLatest();
+        if (connected && translation is not null)
+            subtitles.ReplaceIncoming(translation.Text, clock.Elapsed - Stopwatch.GetElapsedTime(translation.ReadyAt),
+                current.DurationSeconds, translation.RecognizedAt);
+    }
+
+    private void SetIncomingStatus(bool enabled, string detail)
+    {
+        if (status.IncomingActive != enabled || status.IncomingStatus != detail)
+            SetStatus(s => s with { IncomingActive = enabled, IncomingStatus = detail });
+    }
+
+    private void SetIncomingError(Exception error)
+    {
+        string detail = error is ServiceException ? error.Message : $"{error.GetType().Name} / 0x{error.HResult:X8}";
+        SetIncomingStatus(false, $"错误 · {detail}");
+        ReportError(error, "来话翻译");
     }
 
     private void CompleteTake(Settings current)
@@ -260,7 +468,8 @@ internal sealed partial class DesktopRuntime : IDisposable
             else if (subtitles.TextAt(clock.Elapsed, current) is { } text)
             {
                 vr.Show(text, current);
-                subtitles.MarkShown(clock.Elapsed, current.DurationSeconds);
+                if (subtitles.MarkShown(clock.Elapsed, current.DurationSeconds) is long recognizedAt)
+                    log.Write($"来话识别至字幕：{Stopwatch.GetElapsedTime(recognizedAt).TotalMilliseconds:F0} 毫秒");
             }
             else vr.Hide();
             lastOverlayError = null;

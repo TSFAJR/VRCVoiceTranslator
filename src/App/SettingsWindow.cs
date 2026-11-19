@@ -29,6 +29,11 @@ internal sealed class SettingsWindow : Form
     private readonly TextFrame deepLPassword;
     private readonly ComboBox source = DropDown("语音语言", "中文", "英语", "日语", "韩语", "自动");
     private readonly LanguageOrder targets = new();
+    private readonly SettingsSwitch incomingToggle = new("来话翻译") { AutoCheck = false };
+    private readonly SettingsSwitch incomingNoiseFilter = new("加强来话底噪过滤");
+    private readonly Label incomingState = Caption("已关闭", SettingsTheme.Muted);
+    private readonly ComboBox playback = DropDown("来话播放设备");
+    private readonly SettingsButton refreshPlayback = MakeButton("", SettingsButtonStyle.Neutral, SettingsGlyph.Refresh);
     private readonly SettingsSwitch chatEnabled = new("发送 Chatbox 消息");
     private readonly NumericUpDown oscPort = Number("OSC 端口", 1, 65535);
     private readonly Label oscState = Caption("");
@@ -50,6 +55,18 @@ internal sealed class SettingsWindow : Form
     private readonly NumericUpDown distance = Number("距离", 0.5m, 5, 2, 0.1m, " 米");
     private readonly SettingsButton previewButton = MakeButton("在 VR 中预览");
     private readonly HeadsetPreview headsetPreview = new();
+    private readonly SettingsSwitch speechEnabled = new("启用自动播报");
+    private readonly ComboBox speechMode = DropDown("播报模式", "中文原文", "英文译文", "日文译文");
+    private readonly TextBox voiceChinese = Entry("中文音色 ID");
+    private readonly TextBox voiceEnglish = Entry("英文音色 ID");
+    private readonly TextBox voiceJapanese = Entry("日文音色 ID");
+    private readonly NumericUpDown speechVolume = Number("播报音量", 0, 100, unit: "%");
+    private readonly ComboBox speechOutput = DropDown("播报输出设备");
+    private readonly SettingsSwitch speechMonitor = new("监听播报");
+    private readonly ComboBox speechMonitorDevice = DropDown("播报监听设备");
+    private readonly SettingsButton speechPreview = MakeButton("试听", SettingsButtonStyle.Outline);
+    private readonly SettingsButton speechStop = MakeButton("停止播放");
+    private readonly Label speechState = Caption("待机", SettingsTheme.Muted);
     private readonly SettingsButton[] tabs;
     private readonly SettingsPage[] pages;
     private int activePage = -1;
@@ -79,7 +96,7 @@ internal sealed class SettingsWindow : Form
 
         bailianPassword = new(bailianKey, password: true);
         deepLPassword = new(deepLKey, password: true);
-        pages = [MicrophonePage(), ServicePage(), ChatboxPage(), SubtitlePage()];
+        pages = [MicrophonePage(), ServicePage(), ChatboxPage(), SubtitlePage(), SpeechPage()];
         tabs = new SettingsButton[pages.Length];
 
         var layout = new TableLayoutPanel { ColumnCount = 1, RowCount = 4, Margin = Padding.Empty, Dock = DockStyle.Fill };
@@ -127,8 +144,8 @@ internal sealed class SettingsWindow : Form
     private SettingsPage CreateTabs()
     {
         var bar = new SettingsPage { Dock = DockStyle.Fill, Margin = Padding.Empty, BackColor = SettingsTheme.Canvas };
-        string[] labels = ["麦克风与触发", "识别与翻译", "Chatbox", "VR 字幕"];
-        int[] widths = [139, 125, 104, 108];
+        string[] labels = ["麦克风与触发", "识别与翻译", "Chatbox", "VR 字幕", "语音播报"];
+        int[] widths = [139, 125, 104, 108, 108];
         int x = 19;
         for (int i = 0; i < tabs.Length; i++)
         {
@@ -217,32 +234,54 @@ internal sealed class SettingsWindow : Form
     {
         var page = new SettingsPage();
         endpoint.PlaceholderText = "wss://…/api-ws/v1/inference";
-        page.Place(Caption("百炼地址"), 25, 15, 130, 34);
-        page.Place(new TextFrame(endpoint), 163, 15, 495, 33);
-        page.Place(Caption("百炼 API Key"), 25, 55, 130, 34);
-        page.Place(bailianPassword, 163, 55, 495, 33);
-        page.Place(Caption("DeepL API Key"), 25, 95, 130, 34);
-        page.Place(deepLPassword, 163, 95, 495, 33);
-        page.Place(Caption("语音语言"), 25, 135, 130, 34);
-        page.Place(source, 163, 137, 213, 34);
-        Divide(page, 184);
+        page.Place(Caption("百炼地址"), 25, 10, 130, 34);
+        page.Place(new TextFrame(endpoint), 163, 10, 495, 33);
+        page.Place(Caption("百炼 API Key"), 25, 46, 130, 34);
+        page.Place(bailianPassword, 163, 46, 495, 33);
+        page.Place(Caption("DeepL API Key"), 25, 82, 130, 34);
+        page.Place(deepLPassword, 163, 82, 495, 33);
+        page.Place(Caption("语音语言"), 25, 118, 130, 34);
+        page.Place(source, 163, 118, 213, 34);
 
-        page.Place(Caption("译文顺序"), 25, 198, 130, 32);
-        page.Place(targets, 163, 198, 495, 82);
+        page.Place(Caption("译文顺序"), 25, 157, 130, 32);
+        page.Place(targets, 163, 157, 495, 82);
         var add = MakeButton("添加语言", SettingsButtonStyle.Outline, SettingsGlyph.Plus, () =>
         {
             if (LanguageOrder.ChooseLanguage(this, Font) is { } code) targets.AddLanguage(code);
         });
-        page.Place(add, 163, 287, 131, 34);
+        page.Place(add, 25, 199, 122, 34);
         void ResizeLanguages()
         {
             int rows = Math.Min(2, targets.Items.Count);
             targets.Visible = rows > 0;
-            page.MoveControl(targets, 198, rows * 41);
-            page.MoveControl(add, 198 + rows * 41 + (rows == 0 ? 0 : 7));
+            page.MoveControl(targets, 157, rows * 41);
         }
         targets.LanguagesChanged += (_, _) => ResizeLanguages();
         ResizeLanguages();
+
+        Divide(page, 243);
+        page.Place(Caption("来话翻译"), 25, 247, 130, 32);
+        page.Place(incomingToggle, 163, 247, 52, 32);
+        page.Place(incomingState, 225, 247, 254, 32);
+        page.Place(Caption("加强底噪过滤"), 490, 247, 111, 32);
+        page.Place(incomingNoiseFilter, 606, 247, 52, 32);
+        help.SetToolTip(incomingNoiseFilter, "开启来话翻译前调整。加强过滤也可能漏掉轻声说话。");
+        incomingToggle.Click += (_, _) => runtime.SetIncoming(!runtime.Status.IncomingActive, SelectedPlayback, incomingNoiseFilter.Checked);
+        if (IncomingLoopbackCapture.UsesProcessLoopback)
+        {
+            page.Place(Caption("采集 VRChat 的声音，音频发往百炼，识别文字发往 DeepL。", SettingsTheme.Muted),
+                25, 282, 633, 27);
+        }
+        else
+        {
+            page.Place(Caption("播放设备"), 25, 280, 130, 32);
+            page.Place(playback, 163, 280, 443, 32);
+            refreshPlayback.AccessibleName = "刷新播放设备";
+            refreshPlayback.Click += (_, _) => ReloadPlaybackDevices(playback, SelectedPlayback);
+            page.Place(refreshPlayback, 617, 280, 41, 32);
+            page.Place(Caption("采集所选设备播放的所有声音，音频发往百炼，识别文字发往 DeepL。", SettingsTheme.Muted),
+                25, 313, 633, 24);
+        }
         return page;
     }
 
@@ -331,6 +370,45 @@ internal sealed class SettingsWindow : Form
         return page;
     }
 
+    private SettingsPage SpeechPage()
+    {
+        var page = new SettingsPage();
+        page.Place(Caption("启用自动播报"), 25, 12, 130, 34);
+        page.Place(speechEnabled, 163, 12, 52, 34);
+        page.Place(Caption("保存设置后应用", SettingsTheme.Muted), 225, 12, 168, 34);
+        page.Place(Caption("监听播报"), 423, 12, 95, 34);
+        page.Place(speechMonitor, 520, 12, 52, 34);
+        page.Place(Caption("播报模式"), 25, 49, 130, 34);
+        page.Place(speechMode, 163, 49, 213, 34);
+        page.Place(Caption("音量"), 393, 49, 55, 34);
+        page.Place(new SettingsSlider(speechVolume, false), 446, 49, 120, 32);
+        page.Place(new NumberFrame(speechVolume), 576, 49, 82, 32);
+        Divide(page, 90);
+        page.Place(Caption("中文音色 ID"), 25, 100, 130, 34);
+        page.Place(new TextFrame(voiceChinese), 163, 100, 495, 33);
+        page.Place(Caption("英文音色 ID"), 25, 137, 130, 34);
+        page.Place(new TextFrame(voiceEnglish), 163, 137, 495, 33);
+        page.Place(Caption("日文音色 ID"), 25, 174, 130, 34);
+        page.Place(new TextFrame(voiceJapanese), 163, 174, 495, 33);
+        Divide(page, 213);
+        page.Place(Caption("输出设备"), 25, 221, 130, 32);
+        page.Place(speechOutput, 163, 221, 443, 32);
+        var reload = MakeButton("", SettingsButtonStyle.Neutral, SettingsGlyph.Refresh,
+            () => ReloadSpeechDevices(ReadSpeech()));
+        reload.AccessibleName = "刷新播报和监听设备";
+        page.Place(reload, 617, 221, 41, 32);
+        page.Place(Caption("监听设备"), 25, 260, 130, 32);
+        page.Place(speechMonitorDevice, 163, 260, 443, 32);
+        speechMonitorDevice.Enabled = false;
+        speechMonitor.CheckedChanged += (_, _) => speechMonitorDevice.Enabled = speechMonitor.Checked;
+        page.Place(speechPreview, 25, 301, 95, 32);
+        page.Place(speechStop, 132, 301, 108, 32);
+        page.Place(speechState, 251, 301, 407, 32);
+        speechPreview.Click += (_, _) => runtime.PreviewSpeech(ReadSpeech());
+        speechStop.Click += (_, _) => runtime.StopSpeech();
+        return page;
+    }
+
     private void SubtitleRow(SettingsPage page, string label, NumericUpDown number, int y, bool fineAtStart = false)
     {
         page.Place(Caption(label), 20, y, 82, 33);
@@ -365,6 +443,16 @@ internal sealed class SettingsWindow : Form
     private void LoadValues(Settings settings)
     {
         ReloadDevices(settings.MicrophoneId);
+        if (!IncomingLoopbackCapture.UsesProcessLoopback) ReloadPlaybackDevices(playback, settings.IncomingPlaybackDeviceId);
+        incomingNoiseFilter.Checked = settings.IncomingStrongerNoiseFilter;
+        ReloadSpeechDevices(settings.Speech);
+        speechEnabled.Checked = settings.Speech.Enabled;
+        speechMonitor.Checked = settings.Speech.MonitorEnabled;
+        speechMode.SelectedIndex = (int)settings.Speech.Mode;
+        voiceChinese.Text = settings.Speech.ChineseVoice;
+        voiceEnglish.Text = settings.Speech.EnglishVoice;
+        voiceJapanese.Text = settings.Speech.JapaneseVoice;
+        speechVolume.Value = settings.Speech.VolumePercent;
         key = settings.KeyboardVirtualKey;
         hotkey.Text = ((Keys)key).ToString();
         vrMode.SelectedIndex = (int)settings.VrBinding;
@@ -393,6 +481,21 @@ internal sealed class SettingsWindow : Form
         FontPercent = (int)font.Value, OpacityPercent = (int)opacity.Value, DownAngleDegrees = (double)angle.Value, DistanceMeters = (double)distance.Value
     };
 
+    private SpeechSettings ReadSpeech() => new()
+    {
+        Enabled = speechEnabled.Checked, Mode = (SpeechMode)speechMode.SelectedIndex,
+        ChineseVoice = voiceChinese.Text.Trim(), EnglishVoice = voiceEnglish.Text.Trim(), JapaneseVoice = voiceJapanese.Text.Trim(),
+        VolumePercent = (int)speechVolume.Value, OutputDeviceId = (speechOutput.SelectedItem as CaptureDevice)?.Id,
+        MonitorEnabled = speechMonitor.Checked, MonitorDeviceId = (speechMonitorDevice.SelectedItem as CaptureDevice)?.Id
+    };
+
+    private void ReloadSpeechDevices(SpeechSettings settings)
+    {
+        var devices = ReadPlaybackDevices();
+        LoadPlaybackDevices(speechOutput, devices, settings.OutputDeviceId);
+        LoadPlaybackDevices(speechMonitorDevice, devices, settings.MonitorDeviceId);
+    }
+
     private void Save()
     {
         try
@@ -400,10 +503,12 @@ internal sealed class SettingsWindow : Form
             var updated = store.Save(new Settings
             {
                 MicrophoneId = SelectedMicrophone, KeyboardVirtualKey = key, VrBinding = (VrBindingMode)vrMode.SelectedIndex,
+                IncomingPlaybackDeviceId = IncomingLoopbackCapture.UsesProcessLoopback ? runtime.Current.IncomingPlaybackDeviceId : SelectedPlayback,
+                IncomingStrongerNoiseFilter = incomingNoiseFilter.Checked,
                 ExperimentalVrInputOverride = overrideInput.Checked, MaxRecordingSeconds = (int)maxRecording.Value,
                 BailianEndpoint = endpoint.Text, BailianApiKey = bailianKey.Text, DeepLApiKey = deepLKey.Text,
                 SourceLanguage = (SourceLanguage)source.SelectedIndex, TargetLanguages = targets.Codes.ToArray(),
-                ChatboxEnabled = chatEnabled.Checked, OscPort = (int)oscPort.Value, Subtitles = ReadSubtitles()
+                ChatboxEnabled = chatEnabled.Checked, OscPort = (int)oscPort.Value, Subtitles = ReadSubtitles(), Speech = ReadSpeech()
             });
             runtime.Apply(updated);
             MaskPasswords();
@@ -417,6 +522,7 @@ internal sealed class SettingsWindow : Form
     }
 
     private string? SelectedMicrophone => (microphones.SelectedItem as CaptureDevice)?.Id;
+    private string? SelectedPlayback => (playback.SelectedItem as CaptureDevice)?.Id;
 
     private void ReloadDevices(string? selected)
     {
@@ -437,6 +543,29 @@ internal sealed class SettingsWindow : Form
         microphones.Items.AddRange(devices.Cast<object>().ToArray());
         microphones.SelectedIndex = index;
         microphones.DropDownWidth = Math.Max(ScalePixels(440), microphones.Width);
+    }
+
+    private void ReloadPlaybackDevices(ComboBox picker, string? selected) =>
+        LoadPlaybackDevices(picker, ReadPlaybackDevices(), selected);
+
+    private List<CaptureDevice> ReadPlaybackDevices()
+    {
+        try { return CaptureDevice.PlaybackDevices(); }
+        catch (Exception error)
+        {
+            ShowError($"无法枚举播放设备（0x{error.HResult:X8}）。");
+            return [new(null, "Windows 默认播放设备")];
+        }
+    }
+
+    private static void LoadPlaybackDevices(ComboBox picker, List<CaptureDevice> devices, string? selected)
+    {
+        picker.Items.Clear();
+        picker.Items.AddRange(devices.Cast<object>().ToArray());
+        int index = devices.FindIndex(device => device.Id == selected);
+        if (index < 0)
+            index = picker.Items.Add(new CaptureDevice(selected, "已保存的播放设备（当前不可用）"));
+        picker.SelectedIndex = index;
     }
 
     private void StartAssigning()
@@ -471,6 +600,13 @@ internal sealed class SettingsWindow : Form
     private void ReadStatus()
     {
         var status = runtime.Status;
+        speechPreview.Enabled = status.Phase is not VoicePhase.Recording;
+        speechStop.Enabled = status.SpeechActive;
+        if (speechState.Text != status.SpeechStatus)
+        {
+            speechState.Text = status.SpeechStatus;
+            help.SetToolTip(speechState, status.SpeechStatus);
+        }
         steamStatus.Text = status.SteamVrConnected ? "SteamVR 已连接" : "SteamVR 未连接";
         steamDot.SetConnected(status.SteamVrConnected);
         phase.Text = status.Phase switch
@@ -490,6 +626,14 @@ internal sealed class SettingsWindow : Form
             help.SetToolTip(steamStatus, status.Vr);
         }
         errorButton.Visible = status.Error.Length > 0;
+        incomingToggle.Checked = status.IncomingActive;
+        incomingNoiseFilter.Enabled = !status.IncomingActive;
+        playback.Enabled = refreshPlayback.Enabled = !status.IncomingActive;
+        if (incomingState.Text != status.IncomingStatus)
+        {
+            incomingState.Text = status.IncomingStatus;
+            help.SetToolTip(incomingState, status.IncomingStatus);
+        }
         oscState.Text = status.ChatboxState;
         oscPreview.ForeColor = status.ChatboxText.Length == 0 ? SettingsTheme.Muted : SettingsTheme.Ink;
         string output = status.ChatboxText.Length == 0 ? "发送的文字会显示在这里" : status.ChatboxText.Replace("\n", "\r\n");
