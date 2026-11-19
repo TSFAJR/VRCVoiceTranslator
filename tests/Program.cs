@@ -23,6 +23,9 @@ var tests = new (string Name, Func<Task> Run)[]
     ("DeepL parallel target requests and configured order", DeepLOrdering),
     ("DeepL shared deadline, partial failure and ignored late response", DeepLDeadline),
     ("DeepL total failure and auto language filtering", DeepLFallback),
+    ("Qwen-MT provider, regional HTTPS, language mapping and partial errors", QwenMtRequests),
+    ("Qwen-MT target callback and translation deadline", QwenMtDeadline),
+    ("Incoming translation switches to Qwen-MT with auto detection and suppresses repeats", IncomingQwenTranslation),
     ("TTS WebSocket modes, event sequence and streaming PCM", TtsProtocol),
     ("TTS service failure, timeout and discarded late PCM", TtsErrorsAndCancel),
     ("Original TTS precedes and survives DeepL failure", SpeechOriginalParallel),
@@ -31,7 +34,8 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Manual Chatbox text preserves line breaks and room for translations", ManualChatboxPacket),
     ("Subtitle replacement, new expiry and empty translation", SubtitleTiming),
     ("Outgoing subtitle takes priority and expired incoming stays hidden", IncomingSubtitleTiming),
-    ("Settings defaults, save, external edit and malformed preservation", ConfigRoundTrip)
+    ("Settings defaults, save, external edit and malformed preservation", ConfigRoundTrip),
+    ("Bailian Workspace ID endpoints and legacy migration", WorkspaceMigration)
 };
 int failures = 0;
 foreach (var test in tests)
@@ -262,7 +266,7 @@ static async Task IncomingSilenceAndResume()
     int connections = 0;
     var asr = new BailianClient((_, _) => Task.FromResult<WebSocket>(Interlocked.Increment(ref connections) == 1 ? first : second));
     var logs = new List<string>();
-    var speech = new IncomingSpeech(CloudSettings(), asr, new DeepLClient(http), logs.Add);
+    var speech = new IncomingSpeech(CloudSettings(), asr, new TranslationClient(http), logs.Add);
     var feed = new IncomingAudio();
     var work = speech.RunAsync(feed, stop.Token);
     var quiet = PcmFrame(35);
@@ -311,7 +315,7 @@ static async Task IncomingNoiseAndLimit()
     using var http = FakeHttp((_, _) => throw new InvalidOperationException("Blank ASR should not translate."));
     int connections = 0;
     var asr = new BailianClient((_, _) => Task.FromResult<WebSocket>(Interlocked.Increment(ref connections) == 1 ? first : second));
-    var speech = new IncomingSpeech(CloudSettings() with { IncomingStrongerNoiseFilter = true }, asr, new DeepLClient(http), _ => { });
+    var speech = new IncomingSpeech(CloudSettings() with { IncomingStrongerNoiseFilter = true }, asr, new TranslationClient(http), _ => { });
     var feed = new IncomingAudio(strongerNoiseFilter: true);
     var work = speech.RunAsync(feed, stop.Token);
     var noise = PcmFrame(180);
@@ -353,7 +357,7 @@ static async Task IncomingQueueAndStop()
     });
     int connections = 0;
     var asr = new BailianClient((_, _) => Task.FromResult<WebSocket>(++connections == 1 ? first : second));
-    var speech = new IncomingSpeech(CloudSettings(), asr, new DeepLClient(http), _ => { });
+    var speech = new IncomingSpeech(CloudSettings(), asr, new TranslationClient(http), _ => { });
     var feed = new IncomingAudio();
     var work = speech.RunAsync(feed, stop.Token);
     PushIncomingFrames(feed, PcmFrame(2000), 3);
@@ -427,7 +431,7 @@ static async Task DeepLOrdering()
         requested.Writer.TryWrite(code);
         return code == "EN-US" ? await first.Task.WaitAsync(token) : TranslationResponse("ZH", "日本語");
     });
-    var work = new DeepLClient(http).TranslateAsync("原文", CloudSettings() with { TargetLanguages = ["EN-US", "ZH-HANS", "JA"] }, CancellationToken.None);
+    var work = new TranslationClient(http).TranslateAsync("原文", CloudSettings() with { TargetLanguages = ["EN-US", "ZH-HANS", "JA"] }, CancellationToken.None);
     Equal("EN-US", await requested.Reader.ReadAsync());
     Equal("JA", await requested.Reader.ReadAsync());
     True(!requested.Reader.TryRead(out _));
@@ -450,7 +454,7 @@ static async Task DeepLDeadline()
             _ => await slow.Task
         };
     });
-    var result = await new DeepLClient(http, TimeSpan.FromMilliseconds(200)).TranslateAsync("原文",
+    var result = await new TranslationClient(http, TimeSpan.FromMilliseconds(200)).TranslateAsync("原文",
         CloudSettings() with { TargetLanguages = ["JA", "EN-US", "DE"] }, CancellationToken.None);
     Equal("EN-US", result.Results.Single().Language);
     True(result.Errors[0].Contains("JA") && result.Errors[0].Contains("超时"));
@@ -469,11 +473,124 @@ static async Task DeepLFallback()
         return body.RootElement.GetProperty("target_lang").GetString() == "EN-US"
             ? TranslationResponse("EN", "original") : new((HttpStatusCode)456);
     });
-    var batch = await new DeepLClient(http).TranslateAsync("original", CloudSettings() with { SourceLanguage = SourceLanguage.Auto }, CancellationToken.None);
+    var batch = await new TranslationClient(http).TranslateAsync("original", CloudSettings() with { SourceLanguage = SourceLanguage.Auto }, CancellationToken.None);
     Equal(0, batch.Results.Count);
     Equal(1, batch.Errors.Count);
     True(batch.Errors[0].Contains("456"));
     Equal("original", Chatbox.Format(new("original", batch.Results)));
+}
+
+static async Task QwenMtRequests()
+{
+    const string source = "一起去看海吗？";
+    foreach (var (provider, region, regionId, model) in new[]
+    {
+        (TranslationProvider.QwenMtFlash, BailianRegion.Beijing, "cn-beijing", "qwen-mt-flash"),
+        (TranslationProvider.QwenMtLite, BailianRegion.Singapore, "ap-southeast-1", "qwen-mt-lite")
+    })
+    {
+        var requested = Channel.CreateUnbounded<string>();
+        using var http = FakeHttp(async (request, cancellation) =>
+        {
+            Equal(HttpMethod.Post, request.Method);
+            Equal($"https://ws-example.{regionId}.maas.aliyuncs.com/compatible-mode/v1/chat/completions", request.RequestUri?.AbsoluteUri);
+            Equal("Bearer", request.Headers.Authorization?.Scheme);
+            Equal("fake", request.Headers.Authorization?.Parameter);
+            using var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(cancellation));
+            var json = body.RootElement;
+            Equal(model, json.GetProperty("model").GetString());
+            var message = json.GetProperty("messages").EnumerateArray().Single();
+            Equal("user", message.GetProperty("role").GetString());
+            Equal(source, message.GetProperty("content").GetString());
+            var options = json.GetProperty("translation_options");
+            Equal("zh", options.GetProperty("source_lang").GetString());
+            string target = options.GetProperty("target_lang").GetString()!;
+            requested.Writer.TryWrite(target);
+            return target switch
+            {
+                "ja" => new(HttpStatusCode.TooManyRequests),
+                "lo" => MtResponse("长译文", "length"),
+                _ => MtResponse(" " + target + "  ")
+            };
+        });
+        var settings = CloudSettings() with
+        {
+            TranslationProvider = provider, BailianRegion = region, DeepLApiKey = "",
+            TargetLanguages = ["EN-US", "JA", "ZH-HANS", "ZH-HANT", "LO", "PT-BR"]
+        };
+        var batch = await new TranslationClient(http).TranslateAsync(source, settings, CancellationToken.None);
+        Equal("EN-US:en,ZH-HANT:zh_tw,PT-BR:pt", string.Join(',', batch.Results.Select(item => $"{item.Language}:{item.Text}")));
+        True(batch.Errors[0].StartsWith("JA ") && batch.Errors[0].Contains("429"));
+        True(batch.Errors[1].StartsWith("LO ") && batch.Errors[1].Contains(provider == TranslationProvider.QwenMtLite ? "不受" : "完整"));
+        Equal(0, batch.Notices.Count);
+        var sent = new List<string>();
+        while (requested.Reader.TryRead(out var target)) sent.Add(target);
+        Equal(provider == TranslationProvider.QwenMtLite ? "en,ja,pt,zh_tw" : "en,ja,lo,pt,zh_tw",
+            string.Join(',', sent.Order(StringComparer.Ordinal)));
+    }
+}
+
+static async Task QwenMtDeadline()
+{
+    var waiting = new TaskCompletionSource<HttpResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+    using var http = FakeHttp(async (request, token) =>
+    {
+        using var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(token));
+        return body.RootElement.GetProperty("translation_options").GetProperty("target_lang").GetString() == "ja"
+            ? MtResponse("こんにちは") : await waiting.Task;
+    });
+    var settings = CloudSettings() with
+    {
+        TranslationProvider = TranslationProvider.QwenMtFlash,
+        Speech = new() { Enabled = true, Mode = SpeechMode.JapaneseTranslation }
+    };
+    var announced = Channel.CreateUnbounded<SpeechSelection>();
+    try
+    {
+        var work = TakeTranslation.TranslateAsync(new(http, TimeSpan.FromSeconds(1)), "你好", settings,
+            value => announced.Writer.TryWrite(value), CancellationToken.None);
+        Equal(new SpeechSelection("こんにちは", null), await announced.Reader.ReadAsync());
+        True(!work.IsCompleted);
+        var batch = await work;
+        Equal("JA", batch.Results.Single().Language);
+        True(batch.Errors.Single().Contains("EN-US 翻译超时"));
+        True(!announced.Reader.TryRead(out _));
+    }
+    finally { waiting.TrySetResult(MtResponse("Hello")); }
+}
+
+static async Task IncomingQwenTranslation()
+{
+    using var socket = new FakeSocket();
+    using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+    using var http = FakeHttp(async (request, token) =>
+    {
+        using var body = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(token));
+        Equal("qwen-mt-lite", body.RootElement.GetProperty("model").GetString());
+        var options = body.RootElement.GetProperty("translation_options");
+        Equal("auto", options.GetProperty("source_lang").GetString());
+        Equal("zh", options.GetProperty("target_lang").GetString());
+        string? input = body.RootElement.GetProperty("messages")[0].GetProperty("content").GetString();
+        return MtResponse(input == "Hello" ? "你好" : "早上好");
+    });
+    Settings current = CloudSettings() with { DeepLApiKey = "" };
+    var asr = new BailianClient((_, _) => Task.FromResult<WebSocket>(socket));
+    var speech = new IncomingSpeech(current, asr, new TranslationClient(http), _ => { }, () => Volatile.Read(ref current));
+    var feed = new IncomingAudio();
+    var work = speech.RunAsync(feed, stop.Token);
+    PushIncomingFrames(feed, PcmFrame(2400), 3);
+    string id = await socket.TaskId();
+    socket.Event("task-started", id);
+    Volatile.Write(ref current, current with { TranslationProvider = TranslationProvider.QwenMtLite });
+    socket.Sentence(id, 1, "早上好", end: true);
+    while (!speech.Status.Contains("译文与原文相同")) await Task.Delay(10, stop.Token);
+    Equal<IncomingTranslation?>(null, speech.TakeLatest());
+    socket.Sentence(id, 2, "Hello", end: true);
+    IncomingTranslation? translation;
+    while ((translation = speech.TakeLatest()) is null) await Task.Delay(10, stop.Token);
+    Equal("你好", translation.Text);
+    stop.Cancel();
+    _ = await ThrowsAsync<OperationCanceledException>(() => work);
 }
 
 static async Task TtsProtocol()
@@ -737,6 +854,10 @@ static Task ConfigRoundTrip()
     {
         Equal("", store.Load().BailianApiKey);
         var settings = store.Load();
+        Equal(AppearanceMode.System, settings.Appearance);
+        Equal(TranslationProvider.DeepL, settings.TranslationProvider);
+        Equal(BailianRegion.Beijing, settings.BailianRegion);
+        Equal("", settings.BailianWorkspaceId);
         Equal("", settings.DeepLApiKey);
         True(!settings.Speech.Enabled);
         Equal(SpeechMode.ChineseOriginal, settings.Speech.Mode);
@@ -755,13 +876,18 @@ static Task ConfigRoundTrip()
         Equal(9010, settings.OscPort);
         Equal(3d, settings.Subtitles.DurationSeconds);
         Equal(2d, settings.Subtitles.DistanceMeters);
-        store.Save(settings with { BailianApiKey = "one", DeepLApiKey = "two:fx", TargetLanguages = ["ja", "en-us"],
+        Equal(AppearanceMode.System, settings.Appearance);
+        store.Save(settings with { Appearance = AppearanceMode.Dark, BailianApiKey = "one", DeepLApiKey = "two:fx", TargetLanguages = ["ja", "en-us"],
             IncomingPlaybackDeviceId = "example-render-endpoint", IncomingStrongerNoiseFilter = true,
             Speech = new() { Enabled = true, Mode = SpeechMode.JapaneseTranslation, VolumePercent = 35,
                 ChineseVoice = "  zh-voice  ", EnglishVoice = "en-voice", JapaneseVoice = "ja-voice", OutputDeviceId = "tts-output",
                 MonitorEnabled = true, MonitorDeviceId = "headphones" } });
         string raw = File.ReadAllText(store.Path);
         True(raw.Contains("\"one\"") && raw.Contains("\"two:fx\""));
+        True(raw.Contains("\"appearance\": \"dark\""));
+        Equal(AppearanceMode.Dark, store.Load().Appearance);
+        File.WriteAllText(store.Path, raw.Replace("\"appearance\": \"dark\"", "\"appearance\": \"light\""));
+        Equal(AppearanceMode.Light, store.Load().Appearance);
         Equal("JA,EN-US", string.Join(',', store.Load().TargetLanguages));
         Equal("example-render-endpoint", store.Load().IncomingPlaybackDeviceId);
         True(store.Load().IncomingStrongerNoiseFilter);
@@ -783,6 +909,56 @@ static Task ConfigRoundTrip()
     return Task.CompletedTask;
 }
 
+static Task WorkspaceMigration()
+{
+    var store = new SettingsStore(Path.Combine(Path.GetTempPath(), "vrc-workspace-" + Guid.NewGuid().ToString("N"), "config.json"));
+    string directory = Path.GetDirectoryName(store.Path)!;
+    Directory.CreateDirectory(directory);
+    try
+    {
+        foreach (var (region, regionId) in new[] { (BailianRegion.Beijing, "cn-beijing"), (BailianRegion.Singapore, "ap-southeast-1") })
+        {
+            string address = $"wss://ws-migrate.{regionId}.maas.aliyuncs.com/api-ws/v1/inference";
+            File.WriteAllText(store.Path, $$"""{"bailianEndpoint":"{{address}}","bailianApiKey":"old-key","deepLApiKey":"old-deepl","oscPort":9012}""");
+            var migrated = store.Load();
+            Equal("ws-migrate", migrated.BailianWorkspaceId);
+            Equal(region, migrated.BailianRegion);
+            Equal("old-key", migrated.BailianApiKey);
+            Equal("old-deepl", migrated.DeepLApiKey);
+            Equal(9012, migrated.OscPort);
+            Equal(TranslationProvider.DeepL, migrated.TranslationProvider);
+            Equal(address, BailianEndpoints.Audio(migrated).AbsoluteUri);
+            Equal($"https://ws-migrate.{regionId}.maas.aliyuncs.com/compatible-mode/v1/chat/completions", BailianEndpoints.Translation(migrated).AbsoluteUri);
+            True(File.ReadAllText(store.Path).Contains("bailianEndpoint"));
+            store.Save(migrated with { TranslationProvider = TranslationProvider.QwenMtLite });
+            using var saved = JsonDocument.Parse(File.ReadAllText(store.Path));
+            True(!saved.RootElement.TryGetProperty("bailianEndpoint", out _));
+            Equal("ws-migrate", saved.RootElement.GetProperty("bailianWorkspaceId").GetString());
+            Equal("qwen-mt-lite", saved.RootElement.GetProperty("translationProvider").GetString());
+            var reloaded = store.Load();
+            Equal(region, reloaded.BailianRegion);
+            Equal(TranslationProvider.QwenMtLite, reloaded.TranslationProvider);
+            Equal("old-deepl", reloaded.DeepLApiKey);
+        }
+        File.WriteAllText(store.Path, """{"BailianEndpoint":"wss://other.example/api-ws/v1/inference","bailianApiKey":"old-key","oscPort":9013}""");
+        var withoutId = store.Load();
+        Equal("", withoutId.BailianWorkspaceId);
+        Equal("old-key", withoutId.BailianApiKey);
+        Equal(9013, withoutId.OscPort);
+        True(BailianEndpoints.ConfigurationError(withoutId)?.Contains("Workspace ID") == true);
+        True(Throws<FormatException>(() => store.Save(withoutId with { BailianWorkspaceId = "wss://example.com/" })).Message.Contains("Workspace ID"));
+        File.WriteAllText(store.Path, """{"bailianEndpoint":"wss://ws-old.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/inference","bailianWorkspaceId":"ws-new","bailianRegion":"beijing"}""");
+        Equal("ws-new", store.Load().BailianWorkspaceId);
+        Equal(BailianRegion.Beijing, store.Load().BailianRegion);
+    }
+    finally
+    {
+        File.Delete(store.Path);
+        Directory.Delete(directory);
+    }
+    return Task.CompletedTask;
+}
+
 static string ReadOsc(byte[] data, ref int offset)
 {
     int end = Array.IndexOf(data, (byte)0, offset);
@@ -794,13 +970,18 @@ static string ReadOsc(byte[] data, ref int offset)
 
 static Settings CloudSettings() => new()
 {
-    BailianEndpoint = "wss://workspace.example/api-ws/v1/inference", BailianApiKey = "fake", DeepLApiKey = "test:fx"
+    BailianWorkspaceId = "ws-example", BailianApiKey = "fake", DeepLApiKey = "test:fx"
 };
 
 static HttpClient FakeHttp(Func<HttpRequestMessage, CancellationToken, Task<HttpResponseMessage>> send) => new(new FakeHandler(send));
 static HttpResponseMessage TranslationResponse(string source, string text) => new(HttpStatusCode.OK)
 {
     Content = new StringContent(JsonSerializer.Serialize(new { translations = new[] { new { detected_source_language = source, text } } }))
+};
+
+static HttpResponseMessage MtResponse(string text, string finish = "stop") => new(HttpStatusCode.OK)
+{
+    Content = new StringContent(JsonSerializer.Serialize(new { choices = new[] { new { message = new { content = text }, finish_reason = finish } } }))
 };
 
 static void True(bool condition)

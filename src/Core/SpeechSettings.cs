@@ -37,35 +37,35 @@ public readonly record struct SpeechSelection(string? Text, string? SkipReason);
 
 public static class TakeTranslation
 {
-    public static async Task<TranslationBatch> TranslateAsync(DeepLClient deepL, string original, Settings settings,
+    public static async Task<TranslationBatch> TranslateAsync(TranslationClient translator, string original, Settings settings,
         Action<SpeechSelection> announce, CancellationToken cancellation)
     {
         if (!settings.Speech.Enabled)
-            return await deepL.TranslateAsync(original, settings, cancellation).ConfigureAwait(false);
+            return await translator.TranslateAsync(original, settings, cancellation).ConfigureAwait(false);
 
         cancellation.ThrowIfCancellationRequested();
         string? target = settings.Speech.SelectMode().Target;
         if (target is null)
         {
             announce(new(original, null));
-            return await deepL.TranslateAsync(original, settings, cancellation).ConfigureAwait(false);
+            return await translator.TranslateAsync(original, settings, cancellation).ConfigureAwait(false);
         }
         if (!settings.TargetLanguages.Contains(target, StringComparer.Ordinal))
         {
             announce(new(null, $"已跳过播报 · 未配置 {target} 译文。"));
-            return await deepL.TranslateAsync(original, settings, cancellation).ConfigureAwait(false);
+            return await translator.TranslateAsync(original, settings, cancellation).ConfigureAwait(false);
         }
 
         int announced = 0;
-        var batch = await deepL.TranslateAsync(original, settings, cancellation, translation =>
+        var batch = await translator.TranslateAsync(original, settings, cancellation, translation =>
         {
             if (translation.Language == target && Interlocked.Exchange(ref announced, 1) == 0)
                 announce(new(translation.Text, null));
         }).ConfigureAwait(false);
         if (Interlocked.Exchange(ref announced, 1) == 0)
         {
-            string reason = batch.Errors.FirstOrDefault(error => error.StartsWith(target + " ", StringComparison.Ordinal)) ??
-                (string.IsNullOrWhiteSpace(settings.DeepLApiKey) ? "请填写 DeepL API Key。" : $"{target} 没有可用译文。");
+            string reason = batch.Errors.Concat(batch.Notices).FirstOrDefault(message => message.StartsWith(target + " ", StringComparison.Ordinal)) ??
+                TranslationClient.ConfigurationError(settings) ?? $"{target} 没有可用译文。";
             announce(new(null, $"已跳过播报 · {reason}"));
         }
         return batch;

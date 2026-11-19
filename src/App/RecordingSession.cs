@@ -6,7 +6,7 @@ namespace VrcTranslator.Desktop;
 
 internal enum VoicePhase { Idle, Recording, Recognizing, Translating }
 
-internal sealed record CompletedTake(VoiceResult? Result, IReadOnlyList<string> Errors);
+internal sealed record CompletedTake(VoiceResult? Result, IReadOnlyList<string> Errors, IReadOnlyList<string> Notices);
 
 internal sealed class RecordingSession : IDisposable
 {
@@ -18,10 +18,10 @@ internal sealed class RecordingSession : IDisposable
     public Settings Settings { get; }
     public Task<CompletedTake> Work { get; }
 
-    public RecordingSession(Settings settings, BailianClient asr, DeepLClient deepL, Action<string> log, Action<SpeechSelection> announce)
+    public RecordingSession(Settings settings, BailianClient asr, TranslationClient translator, Action<string> log, Action<SpeechSelection> announce)
     {
         Settings = settings;
-        Work = Task.Run(() => ProcessAsync(asr, deepL, log, announce));
+        Work = Task.Run(() => ProcessAsync(asr, translator, log, announce));
     }
 
     public void Submit()
@@ -34,12 +34,11 @@ internal sealed class RecordingSession : IDisposable
 
     public void Cancel() => cancelled.Cancel();
 
-    private async Task<CompletedTake> ProcessAsync(BailianClient asr, DeepLClient deepL, Action<string> log, Action<SpeechSelection> announce)
+    private async Task<CompletedTake> ProcessAsync(BailianClient asr, TranslationClient translator, Action<string> log, Action<SpeechSelection> announce)
     {
         cancelled.Token.ThrowIfCancellationRequested();
-        if (released.Task.IsCompleted) return new(null, []);
-        if (Settings.BailianApiKey.Length == 0 || !Settings.IsWebSocketEndpoint(Settings.BailianEndpoint))
-            throw new ServiceException("请在设置中填写百炼 WebSocket 地址和 API Key。");
+        if (released.Task.IsCompleted) return new(null, [], []);
+        if (BailianEndpoints.ConfigurationError(Settings) is { } error) throw new ServiceException(error);
         using var recognitionLifetime = CancellationTokenSource.CreateLinkedTokenSource(cancelled.Token, finalDeadline.Token);
         var audio = Channel.CreateUnbounded<byte[]>(new UnboundedChannelOptions { SingleWriter = true, SingleReader = true });
         int limit = checked(Settings.MaxRecordingSeconds * 32000);
@@ -81,7 +80,7 @@ internal sealed class RecordingSession : IDisposable
                     await WaitForMicrophoneAsync(microphone, recognitionLifetime.Token).ConfigureAwait(false);
                 }
             }
-            if (bytesLeft == limit) return new(null, []);
+            if (bytesLeft == limit) return new(null, [], []);
             audio.Writer.TryComplete();
             original = await recognition.ConfigureAwait(false);
         }
@@ -96,14 +95,14 @@ internal sealed class RecordingSession : IDisposable
         }
 
         log($"松手或自动提交至最终原文：{Stopwatch.GetElapsedTime(releasedAt).TotalMilliseconds:F0} 毫秒");
-        if (string.IsNullOrWhiteSpace(original)) return new(null, []);
+        if (string.IsNullOrWhiteSpace(original)) return new(null, [], []);
         cancelled.Token.ThrowIfCancellationRequested();
         Volatile.Write(ref phase, (int)VoicePhase.Translating);
         log("开始翻译。");
         long start = Stopwatch.GetTimestamp();
-        var batch = await TakeTranslation.TranslateAsync(deepL, original, Settings, announce, cancelled.Token).ConfigureAwait(false);
+        var batch = await TakeTranslation.TranslateAsync(translator, original, Settings, announce, cancelled.Token).ConfigureAwait(false);
         log($"原文至译文就绪：{Stopwatch.GetElapsedTime(start).TotalMilliseconds:F0} 毫秒，译文 {batch.Results.Count} 项");
-        return new(new(original, batch.Results), batch.Errors);
+        return new(new(original, batch.Results), batch.Errors, batch.Notices);
     }
 
     private Microphone OpenMicrophone(Action<byte[], int> receiver)

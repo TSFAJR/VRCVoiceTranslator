@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Runtime.InteropServices;
 using VrcTranslator;
 
 namespace VrcTranslator.Desktop;
@@ -7,36 +8,53 @@ internal sealed class SettingsWindow : Form
 {
     private readonly SettingsStore store;
     private readonly DesktopRuntime runtime;
+    private readonly ActivityLog log;
     private readonly System.Windows.Forms.Timer refresh = new() { Interval = 125 };
     private readonly ToolTip help = new();
-    private readonly StatusIndicator steamDot = new();
-    private readonly Label steamStatus = Caption("SteamVR 未连接");
-    private readonly Label phase = Caption("待机");
+    private readonly StatusPill steamStatus = new();
+    private readonly Label pageTitle = Caption("", LabelTone.Strong);
+    private readonly BufferedPanel viewport = new() { Dock = DockStyle.Fill, AutoScroll = true };
+    private readonly BufferedPanel content = new() { Dock = DockStyle.Fill };
+    private readonly SettingsPage sidebar = new(216) { Dock = DockStyle.Left };
+    private readonly SettingsPage sidebarFooter = new(216) { Dock = DockStyle.Bottom };
+    private readonly Panel sidebarDivider = new() { BackColor = UiTheme.Line };
+    private readonly BufferedPanel heading = new() { Dock = DockStyle.Top };
+    private readonly SettingsPage headingActions = new(236) { Dock = DockStyle.Right };
+    private readonly SettingsPage footer = new() { Dock = DockStyle.Bottom };
+    private readonly Font bodyFont = new(UiTheme.FontFamily, UiTheme.TextSize);
+    private readonly Font hintFont = new(UiTheme.FontFamily, UiTheme.HintSize);
+    private readonly Font titleFont = new(UiTheme.FontFamily, UiTheme.TitleSize, FontStyle.Bold);
+    private readonly Font brandFont = new(UiTheme.FontFamily, 13f, FontStyle.Bold);
+    private readonly Label translationNotice = Caption("", LabelTone.Muted);
     private readonly SettingsBadge binding = new() { Text = "未连接" };
     private readonly Label saved = Caption("");
-    private readonly SettingsButton errorButton = MakeButton("查看错误", SettingsButtonStyle.Outline);
+    private readonly SettingsButton logButton = MakeButton("日志");
+    private readonly ThemeSegmentedControl appearance = new();
+    private LogWindow? logWindow;
     private readonly ComboBox microphones = DropDown("麦克风");
     private readonly SegmentedMeter meter = new();
     private readonly SettingsButton micTest = MakeButton("测试电平");
     private readonly TextBox hotkey = Entry("键盘热键", readOnly: true);
     private readonly ComboBox vrMode = DropDown("SteamVR 触发", "原生组合键", "双动作同时按住");
-    private readonly CheckBox overrideInput = new() { Text = "使用 SteamVR 实验性输入覆盖", ForeColor = SettingsTheme.Ink };
+    private readonly CheckBox overrideInput = new() { Text = "使用 SteamVR 实验性输入覆盖" };
     private readonly NumericUpDown maxRecording = Number("录音上限", 1, 60, unit: " 秒");
-    private readonly TextBox endpoint = Entry("百炼地址");
+    private readonly TextBox workspaceId = Entry("百炼 Workspace ID");
+    private readonly ComboBox bailianRegion = DropDown("百炼地域", "华北 2（北京）", "新加坡");
     private readonly TextBox bailianKey = Entry("百炼 API Key", password: true);
     private readonly TextBox deepLKey = Entry("DeepL API Key", password: true);
     private readonly TextFrame bailianPassword;
     private readonly TextFrame deepLPassword;
+    private readonly ComboBox translationProvider = DropDown("翻译服务", "DeepL", "qwen-mt-flash", "qwen-mt-lite");
     private readonly ComboBox source = DropDown("语音语言", "中文", "英语", "日语", "韩语", "自动");
     private readonly LanguageOrder targets = new();
     private readonly SettingsSwitch incomingToggle = new("来话翻译") { AutoCheck = false };
     private readonly SettingsSwitch incomingNoiseFilter = new("加强来话底噪过滤");
-    private readonly Label incomingState = Caption("已关闭", SettingsTheme.Muted);
+    private readonly Label incomingState = Caption("已关闭", LabelTone.Muted);
     private readonly ComboBox playback = DropDown("来话播放设备");
     private readonly SettingsButton refreshPlayback = MakeButton("", SettingsButtonStyle.Neutral, SettingsGlyph.Refresh);
     private readonly SettingsSwitch chatEnabled = new("发送 Chatbox 消息");
     private readonly NumericUpDown oscPort = Number("OSC 端口", 1, 65535);
-    private readonly Label oscState = Caption("");
+    private readonly Label oscState = Caption("", LabelTone.Muted);
     private readonly TextBox manualChatbox = new()
     {
         Multiline = true, AcceptsReturn = true, ScrollBars = ScrollBars.Vertical, AccessibleName = "手动输入 Chatbox 文字"
@@ -53,7 +71,7 @@ internal sealed class SettingsWindow : Form
     private readonly NumericUpDown opacity = Number("不透明度", 10, 100, increment: 5, unit: "%");
     private readonly NumericUpDown angle = Number("视线下方", -30, 60, 1, unit: "°");
     private readonly NumericUpDown distance = Number("距离", 0.5m, 5, 2, 0.1m, " 米");
-    private readonly SettingsButton previewButton = MakeButton("在 VR 中预览");
+    private readonly SettingsButton previewButton = MakeButton("在 VR 中预览", SettingsButtonStyle.Outline);
     private readonly HeadsetPreview headsetPreview = new();
     private readonly SettingsSwitch speechEnabled = new("启用自动播报");
     private readonly ComboBox speechMode = DropDown("播报模式", "中文原文", "英文译文", "日文译文");
@@ -66,8 +84,8 @@ internal sealed class SettingsWindow : Form
     private readonly ComboBox speechMonitorDevice = DropDown("播报监听设备");
     private readonly SettingsButton speechPreview = MakeButton("试听", SettingsButtonStyle.Outline);
     private readonly SettingsButton speechStop = MakeButton("停止播放");
-    private readonly Label speechState = Caption("待机", SettingsTheme.Muted);
-    private readonly SettingsButton[] tabs;
+    private readonly Label speechState = Caption("待机", LabelTone.Muted);
+    private readonly NavButton[] tabs;
     private readonly SettingsPage[] pages;
     private int activePage = -1;
     private int key;
@@ -75,121 +93,197 @@ internal sealed class SettingsWindow : Form
     private bool postingManual;
     private bool previewing;
     private bool advancedExpanded;
-    private int heightBeforeAdvanced;
     private bool allowClose;
     private string lastVrInfo = "";
     private DateTime savedUntil;
 
-    public SettingsWindow(SettingsStore store, DesktopRuntime runtime, Icon icon)
+    public SettingsWindow(SettingsStore store, DesktopRuntime runtime, ActivityLog log, Icon icon)
     {
         this.store = store;
         this.runtime = runtime;
+        this.log = log;
         Text = "VRChat 语音翻译";
         Icon = icon;
-        Font = new Font("Microsoft YaHei UI", 12F);
-        BackColor = SettingsTheme.Canvas;
-        ForeColor = SettingsTheme.Ink;
+        Font = bodyFont;
+        DoubleBuffered = true;
+        BackColor = UiTheme.Canvas;
+        ForeColor = UiTheme.Ink;
+        sidebar.BackColor = UiTheme.Sidebar;
+        AutoScaleDimensions = new SizeF(96, 96);
         AutoScaleMode = AutoScaleMode.Dpi;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(714, 500);
-        MinimumSize = new Size(685, 527);
+        ClientSize = new Size(984, 552);
 
         bailianPassword = new(bailianKey, password: true);
         deepLPassword = new(deepLKey, password: true);
         pages = [MicrophonePage(), ServicePage(), ChatboxPage(), SubtitlePage(), SpeechPage()];
-        tabs = new SettingsButton[pages.Length];
+        tabs = new NavButton[pages.Length];
 
-        var layout = new TableLayoutPanel { ColumnCount = 1, RowCount = 4, Margin = Padding.Empty, Dock = DockStyle.Fill };
-        layout.ColumnStyles.Add(new(SizeType.Percent, 100));
-        layout.RowStyles.Add(new(SizeType.Absolute, 41));
-        layout.RowStyles.Add(new(SizeType.Absolute, 46));
-        layout.RowStyles.Add(new(SizeType.Percent, 100));
-        layout.RowStyles.Add(new(SizeType.Absolute, 59));
-        layout.Controls.Add(CreateHeader(), 0, 0);
-        layout.Controls.Add(CreateTabs(), 0, 1);
-        var card = new SettingsCard { Dock = DockStyle.Fill, Margin = new Padding(15, 0, 15, 0), Padding = new Padding(2), BackColor = SettingsTheme.Canvas };
-        foreach (var page in pages)
-        {
-            page.Visible = false;
-            page.Dock = DockStyle.Fill;
-            card.Controls.Add(page);
-        }
-        layout.Controls.Add(card, 0, 2);
-        layout.Controls.Add(CreateFooter(), 0, 3);
-        Controls.Add(layout);
+        CreateSidebar();
+        CreateContent();
+        Controls.Add(content);
+        Controls.Add(sidebar);
+        ApplyShellMetrics();
 
         LoadValues(runtime.Current);
+        appearance.SelectedModeChanged += (_, _) => UpdateAppearance();
         SelectPage(0);
         refresh.Tick += (_, _) => ReadStatus();
         VisibleChanged += (_, _) => { refresh.Enabled = Visible; if (Visible) ReadStatus(); };
         FormClosing += ClosingSettings;
-        Activated += (_, _) => runtime.SetKeyboardPaused(assigningKey || manualChatbox.Focused);
+        Activated += (_, _) =>
+        {
+            if (FollowsSystemAppearance) UpdateAppearance();
+            runtime.SetKeyboardPaused(assigningKey || manualChatbox.Focused);
+        };
         Deactivate += (_, _) => { StopAssigning(); runtime.SetKeyboardPaused(false); MaskPasswords(); };
     }
 
-    private SettingsPage CreateHeader()
+    private void CreateSidebar()
     {
-        var header = new SettingsPage { Dock = DockStyle.Fill, Margin = Padding.Empty, BackColor = SettingsTheme.Canvas };
-        header.Place(steamDot, 24, 2, 18, 35);
-        header.Place(steamStatus, 43, 2, 130, 35);
-        header.Place(new Panel { BackColor = SettingsTheme.InputLine }, 178, 13, 1, 14);
-        header.Place(phase, 201, 2, 140, 35);
-        errorButton.Visible = false;
-        errorButton.Click += (_, _) => { if (runtime.Status.Error.Length > 0) ShowError(runtime.Status.Error); };
-        header.Place(errorButton, 570, 5, 91, 30);
-        header.Place(new Panel { BackColor = SettingsTheme.Line }, 0, 40, 682, 1);
-        return header;
-    }
-
-    private SettingsPage CreateTabs()
-    {
-        var bar = new SettingsPage { Dock = DockStyle.Fill, Margin = Padding.Empty, BackColor = SettingsTheme.Canvas };
+        var brand = Caption("VRChat 语音翻译", LabelTone.Strong);
+        brand.Font = brandFont;
+        sidebar.Place(brand, 20, 22, 180, 30);
+        steamStatus.Font = hintFont;
+        steamStatus.SetStatus(false, "SteamVR 未连接 · 待机");
+        sidebar.Place(steamStatus, 16, 62, 184, 27);
         string[] labels = ["麦克风与触发", "识别与翻译", "Chatbox", "VR 字幕", "语音播报"];
-        int[] widths = [139, 125, 104, 108, 108];
-        int x = 19;
+        SettingsGlyph[] icons = [SettingsGlyph.Microphone, SettingsGlyph.Translate, SettingsGlyph.Chat, SettingsGlyph.Headset, SettingsGlyph.Audio];
         for (int i = 0; i < tabs.Length; i++)
         {
             int index = i;
-            var button = MakeButton(labels[i], SettingsButtonStyle.Tab, action: () => SelectPage(index));
-            button.BackColor = bar.BackColor;
-            tabs[i] = bar.Place(button, x, 0, widths[i], 45);
-            x += widths[i];
+            var nav = new NavButton(labels[i], icons[i]);
+            nav.Click += (_, _) => SelectPage(index);
+            tabs[i] = sidebar.Place(nav, 10, 110 + i * 42, 196, 38);
         }
-        return bar;
+
+        sidebarFooter.Place(sidebarDivider, 12, 0, 192, 1);
+        sidebarFooter.Place(MakeButton("打开配置目录", SettingsButtonStyle.Plain, SettingsGlyph.Folder, OpenConfigFolder),
+            11, 12, 134, 36);
+        sidebar.Controls.Add(sidebarFooter);
     }
 
-    private SettingsPage CreateFooter()
+    private void CreateContent()
     {
-        var footer = new SettingsPage { Dock = DockStyle.Fill, Margin = Padding.Empty, BackColor = SettingsTheme.Canvas };
-        var folder = MakeButton("打开配置目录", SettingsButtonStyle.Plain, SettingsGlyph.Folder, OpenConfigFolder);
-        var save = MakeButton("保存设置", SettingsButtonStyle.Primary, action: Save);
-        folder.BackColor = save.BackColor = footer.BackColor;
-        saved.ForeColor = SettingsTheme.DarkTeal;
+        var headingLabels = new SettingsPage(494) { Dock = DockStyle.Fill };
+        pageTitle.Font = titleFont;
+        pageTitle.AccessibleRole = AccessibleRole.StaticText;
+        headingLabels.Place(pageTitle, 0, 15, 227, 38);
+        translationNotice.Font = hintFont;
+        translationNotice.TextAlign = ContentAlignment.MiddleRight;
+        headingLabels.Place(translationNotice, 229, 18, 253, 32);
+        appearance.AttachToolTips(help);
+        headingActions.Place(appearance, 0, 18, 132, 32);
+        logButton.Click += (_, _) => OpenLogWindow();
+        headingActions.Place(logButton, 142, 18, 94, 32);
+        heading.Controls.Add(headingLabels);
+        heading.Controls.Add(headingActions);
+
+        saved.ForeColor = UiTheme.AccentText;
         saved.TextAlign = ContentAlignment.MiddleRight;
-        footer.Place(folder, 20, 12, 148, 34);
-        footer.Place(saved, 409, 12, 134, 34);
-        footer.Place(save, 550, 12, 114, 35);
-        return footer;
+        footer.Place(saved, 445, 10, 131, 36);
+        footer.Place(MakeButton("保存设置", SettingsButtonStyle.Primary, action: Save), 590, 10, 140, 36);
+
+        foreach (var page in pages)
+        {
+            page.Visible = false;
+            page.Dock = DockStyle.Top;
+            viewport.Controls.Add(page);
+        }
+
+        content.Controls.Add(viewport);
+        content.Controls.Add(footer);
+        content.Controls.Add(heading);
+    }
+
+    protected override void OnHandleCreated(EventArgs e)
+    {
+        base.OnHandleCreated(e);
+        UiTheme.ApplyCaption(Handle);
+        ApplyShellMetrics();
+    }
+
+    protected override void OnDpiChanged(DpiChangedEventArgs e)
+    {
+        base.OnDpiChanged(e);
+        ApplyShellMetrics();
+    }
+
+    private bool FollowsSystemAppearance => appearance.SelectedMode == AppearanceMode.System;
+
+    protected override void WndProc(ref Message message)
+    {
+        const int settingChange = 0x001A;
+        const int themeChanged = 0x031A;
+        bool themeNotification = message.Msg == themeChanged || message.Msg == settingChange && message.LParam != IntPtr.Zero &&
+            Marshal.PtrToStringUni(message.LParam) == "ImmersiveColorSet";
+        base.WndProc(ref message);
+        if (themeNotification && FollowsSystemAppearance && IsHandleCreated && !Disposing)
+            BeginInvoke(UpdateAppearance);
+    }
+
+    private void UpdateAppearance()
+    {
+        if (Disposing || IsDisposed || !UiTheme.Select(appearance.SelectedMode)) return;
+        BackColor = UiTheme.Canvas;
+        ForeColor = UiTheme.Ink;
+        sidebar.BackColor = UiTheme.Sidebar;
+        sidebarDivider.BackColor = UiTheme.Line;
+        UiTheme.ApplyToChildren(this);
+        saved.ForeColor = UiTheme.AccentText;
+        ReadStatus();
+        if (IsHandleCreated) UiTheme.ApplyCaption(Handle);
+        Invalidate(invalidateChildren: true);
+        logWindow?.ApplyTheme();
+    }
+
+    private void ApplyShellMetrics()
+    {
+        sidebar.Width = ScalePixels(216);
+        sidebarFooter.Height = ScalePixels(54);
+        content.Padding = new Padding(ScalePixels(18), 0, ScalePixels(18), 0);
+        heading.Height = ScalePixels(62);
+        headingActions.Width = ScalePixels(236);
+        footer.Height = ScalePixels(58);
+        MinimumSize = SizeFromClientSize(new Size(ScalePixels(878), ScalePixels(404)));
+        pages[0].Height = ScalePixels(advancedExpanded ? 385 : 328);
+        pages[1].Height = ScalePixels(IncomingLoopbackCapture.UsesProcessLoopback ? 382 : 421);
+        pages[2].Height = ScalePixels(360);
+        pages[3].Height = ScalePixels(402);
+        pages[4].Height = ScalePixels(379);
+    }
+
+    private static CardPanel AddCard(SettingsPage page, int x, int y, int width, int height) =>
+        page.Place(new CardPanel(width) { BackColor = UiTheme.Surface }, x, y, width, height);
+
+    private Label Hint(string text)
+    {
+        var hint = Caption(text, LabelTone.Muted);
+        hint.Font = hintFont;
+        return hint;
     }
 
     private SettingsPage MicrophonePage()
     {
         var page = new SettingsPage();
-        page.Place(Caption("麦克风"), 25, 20, 130, 34);
-        page.Place(microphones, 162, 22, 330, 34);
+        var mic = AddCard(page, 0, 0, 357, 270);
+        var trigger = AddCard(page, 373, 0, 357, 270);
+        var advancedCard = AddCard(page, 0, 284, 730, 44);
+
+        mic.Place(Caption("麦克风"), 16, 14, 325, 24);
+        mic.Place(new ComboFrame(microphones), 16, 46, 200, 33);
         var reload = MakeButton("", SettingsButtonStyle.Neutral, SettingsGlyph.Refresh, () => ReloadDevices(SelectedMicrophone));
         reload.AccessibleName = "刷新麦克风";
         help.SetToolTip(reload, reload.AccessibleName);
-        page.Place(reload, 503, 20, 42, 34);
+        mic.Place(reload, 224, 46, 32, 33);
         micTest.Click += (_, _) =>
         {
             if (runtime.MicTestActive) runtime.StopMicTest();
             else runtime.TestMicrophone(SelectedMicrophone);
         };
-        page.Place(micTest, 560, 20, 101, 34);
-        page.Place(Caption("输入电平"), 25, 68, 130, 31);
-        page.Place(meter, 162, 72, 307, 28);
-        Divide(page, 120);
+        mic.Place(micTest, 264, 46, 77, 33);
+        mic.Place(Caption("输入电平"), 16, 99, 325, 24);
+        mic.Place(meter, 16, 129, 325, 31);
 
         hotkey.TabStop = false;
         hotkey.PreviewKeyDown += (_, e) => { if (assigningKey) e.IsInputKey = true; };
@@ -201,31 +295,30 @@ internal sealed class SettingsWindow : Form
             e.SuppressKeyPress = true;
         };
         hotkey.Leave += (_, _) => StopAssigning();
-        page.Place(Caption("键盘热键"), 25, 140, 130, 34);
-        page.Place(new TextFrame(hotkey), 162, 140, 144, 34);
-        page.Place(MakeButton("更改", action: StartAssigning), 319, 140, 72, 34);
-        page.Place(Caption("SteamVR 触发"), 25, 190, 130, 33);
-        page.Place(vrMode, 162, 192, 229, 33);
-        page.Place(binding, 404, 194, 81, 27);
-        page.Place(MakeButton("打开 SteamVR 绑定", SettingsButtonStyle.Outline, action: runtime.OpenBindings), 496, 190, 165, 34);
-        page.Place(Caption("录音上限"), 25, 237, 130, 34);
-        page.Place(new NumberFrame(maxRecording), 162, 237, 136, 34);
-        Divide(page, 287);
+        trigger.Place(Caption("键盘热键"), 16, 14, 325, 24);
+        trigger.Place(new TextFrame(hotkey), 16, 46, 239, 33);
+        trigger.Place(MakeButton("更改", action: StartAssigning), 264, 46, 77, 33);
+        trigger.Place(Caption("SteamVR 触发"), 16, 98, 229, 26);
+        binding.Font = hintFont;
+        trigger.Place(binding, 262, 99, 79, 24);
+        trigger.Place(new ComboFrame(vrMode), 16, 132, 165, 33);
+        trigger.Place(MakeButton("打开 SteamVR 绑定", SettingsButtonStyle.Outline, action: runtime.OpenBindings), 189, 132, 152, 33);
+        trigger.Place(Caption("录音上限"), 16, 183, 325, 25);
+        trigger.Place(new NumberFrame(maxRecording), 16, 215, 117, 32);
 
         var advanced = MakeButton("高级设置", SettingsButtonStyle.Plain, SettingsGlyph.Chevron);
-        page.Place(advanced, 23, 296, 118, 35);
-        page.Place(overrideInput, 30, 332, 350, 28).Visible = false;
-        var note = Caption("仅在按键冲突时启用。需同时开启 SteamVR 对应开发者设置。", SettingsTheme.Muted);
-        page.Place(note, 30, 359, 620, 30).Visible = false;
+        advancedCard.Place(advanced, 13, 5, 106, 34);
+        advancedCard.Place(overrideInput, 20, 43, 350, 26).Visible = false;
+        var note = Hint("仅在按键冲突时启用。需同时开启 SteamVR 对应开发者设置。");
+        advancedCard.Place(note, 20, 69, 680, 24).Visible = false;
         advanced.Click += (_, _) =>
         {
             advancedExpanded = !advancedExpanded;
             advanced.SetGlyph(advancedExpanded ? SettingsGlyph.Down : SettingsGlyph.Chevron);
             overrideInput.Visible = note.Visible = advancedExpanded;
-            int expandedHeight = ScalePixels(579);
-            if (advancedExpanded) heightBeforeAdvanced = Height;
-            MinimumSize = new Size(MinimumSize.Width, ScalePixels(advancedExpanded ? 579 : 527));
-            if (!advancedExpanded && Height == expandedHeight) Height = Math.Max(MinimumSize.Height, heightBeforeAdvanced);
+            page.MoveControl(advancedCard, 284, advancedExpanded ? 101 : 44);
+            page.Height = ScalePixels(advancedExpanded ? 385 : 328);
+            if (advancedExpanded) viewport.ScrollControlIntoView(note);
         };
         return page;
     }
@@ -233,54 +326,71 @@ internal sealed class SettingsWindow : Form
     private SettingsPage ServicePage()
     {
         var page = new SettingsPage();
-        endpoint.PlaceholderText = "wss://…/api-ws/v1/inference";
-        page.Place(Caption("百炼地址"), 25, 10, 130, 34);
-        page.Place(new TextFrame(endpoint), 163, 10, 495, 33);
-        page.Place(Caption("百炼 API Key"), 25, 46, 130, 34);
-        page.Place(bailianPassword, 163, 46, 495, 33);
-        page.Place(Caption("DeepL API Key"), 25, 82, 130, 34);
-        page.Place(deepLPassword, 163, 82, 495, 33);
-        page.Place(Caption("语音语言"), 25, 118, 130, 34);
-        page.Place(source, 163, 118, 213, 34);
+        var credentials = AddCard(page, 0, 0, 730, 119);
+        var translation = AddCard(page, 0, 131, 730, 159);
+        var incoming = AddCard(page, 0, 302, 730, IncomingLoopbackCapture.UsesProcessLoopback ? 80 : 119);
 
-        page.Place(Caption("译文顺序"), 25, 157, 130, 32);
-        page.Place(targets, 163, 157, 495, 82);
+        workspaceId.PlaceholderText = "业务空间 ID";
+        credentials.Place(Caption("百炼 Workspace ID"), 16, 11, 147, 29);
+        credentials.Place(new TextFrame(workspaceId), 167, 11, 260, 29);
+        credentials.Place(Caption("服务地域"), 445, 11, 94, 29);
+        credentials.Place(new ComboFrame(bailianRegion), 543, 11, 171, 29);
+        credentials.Place(Caption("百炼 API Key"), 16, 45, 147, 29);
+        credentials.Place(bailianPassword, 167, 45, 547, 29);
+        var deepLLabel = credentials.Place(Caption("DeepL API Key"), 16, 79, 147, 29);
+        credentials.Place(deepLPassword, 167, 79, 547, 29);
+        var qwenKeyNote = credentials.Place(Hint("Qwen-MT 复用上方的百炼 API Key。"), 16, 79, 698, 29);
+
+        translation.Place(Caption("翻译服务"), 16, 11, 147, 30);
+        translation.Place(new ComboFrame(translationProvider), 167, 11, 260, 30);
+        translation.Place(Caption("语音语言"), 445, 11, 94, 30);
+        translation.Place(new ComboFrame(source), 543, 11, 171, 30);
+        void UpdateKeyField()
+        {
+            bool useDeepL = translationProvider.SelectedIndex == (int)TranslationProvider.DeepL;
+            deepLLabel.Visible = deepLPassword.Visible = useDeepL;
+            qwenKeyNote.Visible = !useDeepL;
+            if (!useDeepL) deepLPassword.MaskPassword();
+        }
+        translationProvider.SelectedIndexChanged += (_, _) => UpdateKeyField();
+
+        translation.Place(Caption("译文顺序"), 16, 47, 147, 30);
+        translation.Place(targets, 167, 47, 547, 2 * LanguageOrder.LogicalItemHeight);
         var add = MakeButton("添加语言", SettingsButtonStyle.Outline, SettingsGlyph.Plus, () =>
         {
             if (LanguageOrder.ChooseLanguage(this, Font) is { } code) targets.AddLanguage(code);
         });
-        page.Place(add, 25, 199, 122, 34);
+        translation.Place(add, 167, 121, 152, 28);
         void ResizeLanguages()
         {
             int rows = Math.Min(2, targets.Items.Count);
             targets.Visible = rows > 0;
-            page.MoveControl(targets, 157, rows * 41);
+            translation.MoveControl(targets, 47, rows * LanguageOrder.LogicalItemHeight);
+            translation.MoveControl(add, 47 + rows * LanguageOrder.LogicalItemHeight + (rows == 0 ? 0 : 7));
         }
         targets.LanguagesChanged += (_, _) => ResizeLanguages();
         ResizeLanguages();
 
-        Divide(page, 243);
-        page.Place(Caption("来话翻译"), 25, 247, 130, 32);
-        page.Place(incomingToggle, 163, 247, 52, 32);
-        page.Place(incomingState, 225, 247, 254, 32);
-        page.Place(Caption("加强底噪过滤"), 490, 247, 111, 32);
-        page.Place(incomingNoiseFilter, 606, 247, 52, 32);
+        incoming.Place(Caption("来话翻译"), 16, 11, 112, 29);
+        incoming.Place(incomingToggle, 125, 11, 52, 29);
+        incomingState.Font = hintFont;
+        incoming.Place(incomingState, 189, 11, 262, 29);
+        incoming.Place(Caption("加强底噪过滤"), 502, 11, 153, 29);
+        incoming.Place(incomingNoiseFilter, 662, 11, 52, 29);
         help.SetToolTip(incomingNoiseFilter, "开启来话翻译前调整。加强过滤也可能漏掉轻声说话。");
         incomingToggle.Click += (_, _) => runtime.SetIncoming(!runtime.Status.IncomingActive, SelectedPlayback, incomingNoiseFilter.Checked);
         if (IncomingLoopbackCapture.UsesProcessLoopback)
         {
-            page.Place(Caption("采集 VRChat 的声音，音频发往百炼，识别文字发往 DeepL。", SettingsTheme.Muted),
-                25, 282, 633, 27);
+            incoming.Place(Hint("采集 VRChat 的声音，音频交给百炼，文字交给所选翻译服务。"), 16, 42, 698, 26);
         }
         else
         {
-            page.Place(Caption("播放设备"), 25, 280, 130, 32);
-            page.Place(playback, 163, 280, 443, 32);
+            incoming.Place(Caption("播放设备"), 16, 47, 147, 30);
+            incoming.Place(new ComboFrame(playback), 167, 47, 503, 30);
             refreshPlayback.AccessibleName = "刷新播放设备";
             refreshPlayback.Click += (_, _) => ReloadPlaybackDevices(playback, SelectedPlayback);
-            page.Place(refreshPlayback, 617, 280, 41, 32);
-            page.Place(Caption("采集所选设备播放的所有声音，音频发往百炼，识别文字发往 DeepL。", SettingsTheme.Muted),
-                25, 313, 633, 24);
+            incoming.Place(refreshPlayback, 681, 47, 33, 30);
+            incoming.Place(Hint("采集所选设备的全部声音。音频交给百炼，文字交给所选翻译服务。"), 16, 82, 698, 26);
         }
         return page;
     }
@@ -288,19 +398,24 @@ internal sealed class SettingsWindow : Form
     private SettingsPage ChatboxPage()
     {
         var page = new SettingsPage();
-        page.Place(Caption("发送 Chatbox 消息"), 25, 18, 166, 34);
-        page.Place(chatEnabled, 200, 18, 52, 34);
-        page.Place(Caption("OSC 端口"), 25, 69, 130, 34);
-        page.Place(new NumberFrame(oscPort), 200, 69, 135, 34);
-        page.Place(MakeButton("发送测试消息", SettingsButtonStyle.Outline, action: () => runtime.TestChatbox((int)oscPort.Value)), 357, 69, 135, 34);
-        page.Place(oscState, 506, 69, 155, 34);
-        oscState.ForeColor = SettingsTheme.Muted;
-        page.Place(Caption("手动输入"), 25, 111, 160, 28);
-        page.Place(new TextFrame(manualChatbox), 25, 142, 501, 77);
-        page.Place(sendManual, 543, 142, 115, 34);
-        var shortcut = Caption("Ctrl + Enter", SettingsTheme.Muted);
+        var output = AddCard(page, 0, 0, 730, 93);
+        var manual = AddCard(page, 0, 106, 730, 112);
+        var recent = AddCard(page, 0, 231, 730, 129);
+
+        output.Place(Caption("发送 Chatbox 消息"), 16, 12, 168, 30);
+        output.Place(chatEnabled, 189, 12, 52, 30);
+        output.Place(Caption("OSC 端口"), 16, 49, 168, 31);
+        output.Place(new NumberFrame(oscPort), 189, 49, 115, 31);
+        output.Place(MakeButton("发送测试消息", SettingsButtonStyle.Outline, action: () => runtime.TestChatbox((int)oscPort.Value)), 575, 49, 139, 31);
+        oscState.Font = hintFont;
+        output.Place(oscState, 323, 49, 239, 31);
+
+        manual.Place(Caption("手动输入"), 16, 14, 83, 28);
+        manual.Place(new TextFrame(manualChatbox), 101, 14, 461, 84);
+        manual.Place(sendManual, 575, 32, 139, 33);
+        var shortcut = Hint("Ctrl + Enter");
         shortcut.TextAlign = ContentAlignment.MiddleCenter;
-        page.Place(shortcut, 543, 179, 115, 27);
+        manual.Place(shortcut, 575, 67, 139, 23);
         sendManual.Click += SendManualChatbox;
         manualChatbox.TextChanged += (_, _) => UpdateManualSendButton();
         manualChatbox.Enter += (_, _) => runtime.SetKeyboardPaused(true);
@@ -314,8 +429,8 @@ internal sealed class SettingsWindow : Form
         };
         UpdateManualSendButton();
 
-        page.Place(Caption("最近输出预览"), 25, 225, 165, 30);
-        page.Place(new TextFrame(oscPreview, preview: true), 25, 258, 633, 80);
+        recent.Place(Caption("最近输出预览"), 16, 8, 698, 26);
+        recent.Place(new TextFrame(oscPreview, preview: true), 16, 38, 698, 76);
         return page;
     }
 
@@ -348,17 +463,20 @@ internal sealed class SettingsWindow : Form
     private SettingsPage SubtitlePage()
     {
         var page = new SettingsPage();
-        page.Place(Caption("显示头显字幕"), 20, 17, 134, 31);
-        page.Place(subtitleEnabled, 155, 17, 52, 31);
-        page.Place(Caption("显示原文"), 20, 52, 134, 31);
-        page.Place(original, 155, 52, 52, 31);
-        SubtitleRow(page, "显示时长", duration, 92, fineAtStart: true);
-        SubtitleRow(page, "字号", font, 131);
-        SubtitleRow(page, "不透明度", opacity, 170);
-        SubtitleRow(page, "视线下方", angle, 209);
-        SubtitleRow(page, "距离", distance, 248);
-        page.Place(headsetPreview, 373, 34, 294, 198);
-        page.Place(previewButton, 420, 250, 198, 34);
+        var options = AddCard(page, 0, 0, 284, 402);
+        var preview = AddCard(page, 300, 0, 430, 350);
+        options.Place(Caption("显示头显字幕"), 16, 13, 191, 28);
+        options.Place(subtitleEnabled, 215, 13, 53, 28);
+        options.Place(Caption("显示原文"), 16, 49, 191, 28);
+        options.Place(original, 215, 49, 53, 28);
+        SubtitleRow(options, "显示时长", duration, 89, fineAtStart: true);
+        SubtitleRow(options, "字号", font, 149);
+        SubtitleRow(options, "不透明度", opacity, 209);
+        SubtitleRow(options, "视线下方", angle, 269);
+        SubtitleRow(options, "距离", distance, 329);
+        preview.Place(Caption("头显视角预览"), 16, 8, 398, 27);
+        preview.Place(headsetPreview, 16, 41, 398, 250);
+        preview.Place(previewButton, 145, 306, 140, 32);
         previewButton.Click += (_, _) =>
         {
             previewing = !previewing;
@@ -373,37 +491,43 @@ internal sealed class SettingsWindow : Form
     private SettingsPage SpeechPage()
     {
         var page = new SettingsPage();
-        page.Place(Caption("启用自动播报"), 25, 12, 130, 34);
-        page.Place(speechEnabled, 163, 12, 52, 34);
-        page.Place(Caption("保存设置后应用", SettingsTheme.Muted), 225, 12, 168, 34);
-        page.Place(Caption("监听播报"), 423, 12, 95, 34);
-        page.Place(speechMonitor, 520, 12, 52, 34);
-        page.Place(Caption("播报模式"), 25, 49, 130, 34);
-        page.Place(speechMode, 163, 49, 213, 34);
-        page.Place(Caption("音量"), 393, 49, 55, 34);
-        page.Place(new SettingsSlider(speechVolume, false), 446, 49, 120, 32);
-        page.Place(new NumberFrame(speechVolume), 576, 49, 82, 32);
-        Divide(page, 90);
-        page.Place(Caption("中文音色 ID"), 25, 100, 130, 34);
-        page.Place(new TextFrame(voiceChinese), 163, 100, 495, 33);
-        page.Place(Caption("英文音色 ID"), 25, 137, 130, 34);
-        page.Place(new TextFrame(voiceEnglish), 163, 137, 495, 33);
-        page.Place(Caption("日文音色 ID"), 25, 174, 130, 34);
-        page.Place(new TextFrame(voiceJapanese), 163, 174, 495, 33);
-        Divide(page, 213);
-        page.Place(Caption("输出设备"), 25, 221, 130, 32);
-        page.Place(speechOutput, 163, 221, 443, 32);
+        var speech = AddCard(page, 0, 0, 730, 97);
+        var voices = AddCard(page, 0, 110, 730, 120);
+        var playbackCard = AddCard(page, 0, 243, 730, 136);
+
+        speech.Place(Caption("启用自动播报"), 16, 9, 142, 30);
+        speech.Place(speechEnabled, 161, 9, 52, 30);
+        speech.Place(Hint("保存设置后应用"), 224, 9, 174, 30);
+        speech.Place(Caption("监听播报"), 497, 9, 153, 30);
+        speech.Place(speechMonitor, 662, 9, 52, 30);
+        speech.Place(Caption("播报模式"), 16, 51, 102, 32);
+        speech.Place(new ComboFrame(speechMode), 121, 51, 220, 32);
+        speech.Place(Caption("播报音量"), 363, 51, 78, 32);
+        var volumeSlider = speech.Place(new SettingsSlider(speechVolume, false), 446, 51, 173, 32);
+        speech.Place(new NumberFrame(speechVolume, pill: true), 629, 51, 85, 32);
+        help.SetToolTip(volumeSlider, "同时调整输出设备和监听设备的音量。");
+
+        voices.Place(Caption("中文音色 ID"), 16, 10, 145, 30);
+        voices.Place(new TextFrame(voiceChinese), 167, 10, 547, 30);
+        voices.Place(Caption("英文音色 ID"), 16, 45, 145, 30);
+        voices.Place(new TextFrame(voiceEnglish), 167, 45, 547, 30);
+        voices.Place(Caption("日文音色 ID"), 16, 80, 145, 30);
+        voices.Place(new TextFrame(voiceJapanese), 167, 80, 547, 30);
+
+        playbackCard.Place(Caption("输出设备"), 16, 11, 145, 31);
+        playbackCard.Place(new ComboFrame(speechOutput), 167, 11, 503, 31);
         var reload = MakeButton("", SettingsButtonStyle.Neutral, SettingsGlyph.Refresh,
             () => ReloadSpeechDevices(ReadSpeech()));
         reload.AccessibleName = "刷新播报和监听设备";
-        page.Place(reload, 617, 221, 41, 32);
-        page.Place(Caption("监听设备"), 25, 260, 130, 32);
-        page.Place(speechMonitorDevice, 163, 260, 443, 32);
+        playbackCard.Place(reload, 681, 11, 33, 31);
+        playbackCard.Place(Caption("监听设备"), 16, 48, 145, 31);
+        playbackCard.Place(new ComboFrame(speechMonitorDevice), 167, 48, 503, 31);
         speechMonitorDevice.Enabled = false;
         speechMonitor.CheckedChanged += (_, _) => speechMonitorDevice.Enabled = speechMonitor.Checked;
-        page.Place(speechPreview, 25, 301, 95, 32);
-        page.Place(speechStop, 132, 301, 108, 32);
-        page.Place(speechState, 251, 301, 407, 32);
+        playbackCard.Place(speechPreview, 16, 93, 95, 31);
+        playbackCard.Place(speechStop, 122, 93, 104, 31);
+        playbackCard.Place(speechState, 245, 93, 469, 31);
+        speechState.Font = hintFont;
         speechPreview.Click += (_, _) => runtime.PreviewSpeech(ReadSpeech());
         speechStop.Click += (_, _) => runtime.StopSpeech();
         return page;
@@ -411,9 +535,9 @@ internal sealed class SettingsWindow : Form
 
     private void SubtitleRow(SettingsPage page, string label, NumericUpDown number, int y, bool fineAtStart = false)
     {
-        page.Place(Caption(label), 20, y, 82, 33);
-        page.Place(new SettingsSlider(number, fineAtStart), 101, y, 154, 33);
-        page.Place(new NumberFrame(number), 265, y, 89, 32);
+        page.Place(Caption(label), 16, y, 148, 29);
+        page.Place(new NumberFrame(number, pill: true), 171, y, 97, 29);
+        page.Place(new SettingsSlider(number, fineAtStart), 13, y + 31, 258, 23);
         number.ValueChanged += (_, _) => UpdatePreview();
     }
 
@@ -425,6 +549,8 @@ internal sealed class SettingsWindow : Form
         activePage = index;
         pages[index].Show();
         pages[index].BringToFront();
+        viewport.AutoScrollPosition = Point.Empty;
+        pageTitle.Text = tabs[index].Text;
         for (int i = 0; i < tabs.Length; i++) tabs[i].SetSelected(i == index);
     }
 
@@ -442,6 +568,7 @@ internal sealed class SettingsWindow : Form
 
     private void LoadValues(Settings settings)
     {
+        appearance.SelectedMode = settings.Appearance;
         ReloadDevices(settings.MicrophoneId);
         if (!IncomingLoopbackCapture.UsesProcessLoopback) ReloadPlaybackDevices(playback, settings.IncomingPlaybackDeviceId);
         incomingNoiseFilter.Checked = settings.IncomingStrongerNoiseFilter;
@@ -458,9 +585,11 @@ internal sealed class SettingsWindow : Form
         vrMode.SelectedIndex = (int)settings.VrBinding;
         overrideInput.Checked = settings.ExperimentalVrInputOverride;
         maxRecording.Value = settings.MaxRecordingSeconds;
-        endpoint.Text = settings.BailianEndpoint;
+        workspaceId.Text = settings.BailianWorkspaceId;
+        bailianRegion.SelectedIndex = (int)settings.BailianRegion;
         bailianKey.Text = settings.BailianApiKey;
         deepLKey.Text = settings.DeepLApiKey;
+        translationProvider.SelectedIndex = (int)settings.TranslationProvider;
         source.SelectedIndex = (int)settings.SourceLanguage;
         foreach (var target in settings.TargetLanguages) targets.AddLanguage(target, select: false);
         chatEnabled.Checked = settings.ChatboxEnabled;
@@ -502,11 +631,14 @@ internal sealed class SettingsWindow : Form
         {
             var updated = store.Save(new Settings
             {
+                Appearance = appearance.SelectedMode,
                 MicrophoneId = SelectedMicrophone, KeyboardVirtualKey = key, VrBinding = (VrBindingMode)vrMode.SelectedIndex,
                 IncomingPlaybackDeviceId = IncomingLoopbackCapture.UsesProcessLoopback ? runtime.Current.IncomingPlaybackDeviceId : SelectedPlayback,
                 IncomingStrongerNoiseFilter = incomingNoiseFilter.Checked,
                 ExperimentalVrInputOverride = overrideInput.Checked, MaxRecordingSeconds = (int)maxRecording.Value,
-                BailianEndpoint = endpoint.Text, BailianApiKey = bailianKey.Text, DeepLApiKey = deepLKey.Text,
+                BailianWorkspaceId = workspaceId.Text, BailianRegion = (BailianRegion)bailianRegion.SelectedIndex,
+                BailianApiKey = bailianKey.Text, DeepLApiKey = deepLKey.Text,
+                TranslationProvider = (TranslationProvider)translationProvider.SelectedIndex,
                 SourceLanguage = (SourceLanguage)source.SelectedIndex, TargetLanguages = targets.Codes.ToArray(),
                 ChatboxEnabled = chatEnabled.Checked, OscPort = (int)oscPort.Value, Subtitles = ReadSubtitles(), Speech = ReadSpeech()
             });
@@ -607,25 +739,27 @@ internal sealed class SettingsWindow : Form
             speechState.Text = status.SpeechStatus;
             help.SetToolTip(speechState, status.SpeechStatus);
         }
-        steamStatus.Text = status.SteamVrConnected ? "SteamVR 已连接" : "SteamVR 未连接";
-        steamDot.SetConnected(status.SteamVrConnected);
-        phase.Text = status.Phase switch
+        string phase = status.Phase switch
         {
             VoicePhase.Recording => "录音中", VoicePhase.Recognizing => "识别中", VoicePhase.Translating => "翻译中", _ => "待机"
         };
-        phase.ForeColor = status.Phase == VoicePhase.Idle ? SettingsTheme.Ink : SettingsTheme.DarkTeal;
+        steamStatus.SetStatus(status.SteamVrConnected, $"SteamVR {(status.SteamVrConnected ? "已连接" : "未连接")} · {phase}");
         var vr = status.Binding;
         binding.Text = !status.SteamVrConnected ? "未连接" : !vr.Bound ? "待绑定" :
             !vr.Trigger.Available ? "不可用" : vr.Trigger.Held ? "按住" : "已绑定";
-        binding.ForeColor = !status.SteamVrConnected ? SettingsTheme.Muted : vr.Bound ? SettingsTheme.DarkTeal : Color.FromArgb(148, 86, 13);
-        binding.BackColor = !status.SteamVrConnected ? SettingsTheme.Line : vr.Bound ? SettingsTheme.TealTint : Color.FromArgb(252, 235, 204);
+        binding.ForeColor = !status.SteamVrConnected ? UiTheme.Muted : vr.Bound ? UiTheme.AccentText : UiTheme.Amber;
+        binding.BackColor = !status.SteamVrConnected ? UiTheme.Track : vr.Bound ? UiTheme.TealTint : UiTheme.AmberTint;
         if (lastVrInfo != status.Vr)
         {
             lastVrInfo = status.Vr;
             help.SetToolTip(binding, status.Vr);
             help.SetToolTip(steamStatus, status.Vr);
         }
-        errorButton.Visible = status.Error.Length > 0;
+        if (translationNotice.Text != status.TranslationNotice)
+        {
+            translationNotice.Text = status.TranslationNotice;
+            help.SetToolTip(translationNotice, status.TranslationNotice);
+        }
         incomingToggle.Checked = status.IncomingActive;
         incomingNoiseFilter.Enabled = !status.IncomingActive;
         playback.Enabled = refreshPlayback.Enabled = !status.IncomingActive;
@@ -635,12 +769,27 @@ internal sealed class SettingsWindow : Form
             help.SetToolTip(incomingState, status.IncomingStatus);
         }
         oscState.Text = status.ChatboxState;
-        oscPreview.ForeColor = status.ChatboxText.Length == 0 ? SettingsTheme.Muted : SettingsTheme.Ink;
+        oscPreview.ForeColor = status.ChatboxText.Length == 0 ? UiTheme.Muted : UiTheme.Ink;
         string output = status.ChatboxText.Length == 0 ? "发送的文字会显示在这里" : status.ChatboxText.Replace("\n", "\r\n");
         if (oscPreview.Text != output) oscPreview.Text = output;
         meter.SetLevel(runtime.Meter);
         micTest.Text = runtime.MicTestActive ? "停止测试" : "测试电平";
         if (DateTime.UtcNow >= savedUntil) saved.Text = "";
+    }
+
+    private void OpenLogWindow()
+    {
+        if (logWindow is { IsDisposed: false } existing)
+        {
+            existing.WindowState = FormWindowState.Normal;
+            existing.Activate();
+            return;
+        }
+
+        var window = new LogWindow(log) { Font = Font, Icon = Icon };
+        window.FormClosed += (_, _) => logWindow = null;
+        logWindow = window;
+        window.Show(this);
     }
 
     private void OpenConfigFolder()
@@ -656,6 +805,7 @@ internal sealed class SettingsWindow : Form
 
     private void ClosingSettings(object? sender, FormClosingEventArgs e)
     {
+        logWindow?.Close();
         previewing = false;
         previewButton.Text = "在 VR 中预览";
         UpdatePreview();
@@ -670,13 +820,16 @@ internal sealed class SettingsWindow : Form
 
     public void CloseForExit() { allowClose = true; Close(); }
 
-    private void ShowError(string error) => MessageBox.Show(this, error, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+    private void ShowError(string error)
+    {
+        log.Write(error.ReplaceLineEndings(" "));
+        MessageBox.Show(this, error, Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
+    }
     private int ScalePixels(int pixels) => (int)Math.Round(pixels * DeviceDpi / 96f);
 
-    private static void Divide(SettingsPage page, int y) => page.Place(new Panel { BackColor = SettingsTheme.Line }, 18, y, 640, 1);
-    private static Label Caption(string text, Color? ink = null) => new()
+    private static Label Caption(string text, LabelTone tone = LabelTone.Normal) => new ThemeLabel(tone)
     {
-        Text = text, TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true, ForeColor = ink ?? SettingsTheme.Ink
+        Text = text, TextAlign = ContentAlignment.MiddleLeft, AutoEllipsis = true
     };
 
     private static TextBox Entry(string name, bool readOnly = false, bool password = false) => new()
@@ -687,28 +840,28 @@ internal sealed class SettingsWindow : Form
     private static SettingsButton MakeButton(string text, SettingsButtonStyle style = SettingsButtonStyle.Neutral,
         SettingsGlyph glyph = SettingsGlyph.None, Action? action = null)
     {
-        var button = new SettingsButton(text, style, glyph) { BackColor = SettingsTheme.Surface };
+        var button = new SettingsButton(text, style, glyph);
         if (action is not null) button.Click += (_, _) => action();
         return button;
     }
 
     private static ComboBox DropDown(string name, params string[] items)
     {
-        var combo = new ComboBox
+        var combo = new DarkComboBox
         {
             AccessibleName = name, DropDownStyle = ComboBoxStyle.DropDownList, DrawMode = DrawMode.OwnerDrawFixed,
-            FlatStyle = FlatStyle.Flat, BackColor = Color.FromArgb(253, 254, 254), ItemHeight = 27
+            FlatStyle = FlatStyle.Flat, BackColor = UiTheme.Input, ForeColor = UiTheme.Ink, ItemHeight = 22
         };
         combo.Items.AddRange(items);
         combo.DrawItem += (_, e) =>
         {
             if (e.Index < 0) return;
             bool isSelection = (e.State & DrawItemState.ComboBoxEdit) != 0;
-            Color fill = !isSelection && (e.State & DrawItemState.Selected) != 0 ? SettingsTheme.TealTint : combo.BackColor;
+            Color fill = !isSelection && (e.State & DrawItemState.Selected) != 0 ? UiTheme.TealTint : combo.BackColor;
             using var brush = new SolidBrush(fill);
             e.Graphics.FillRectangle(brush, e.Bounds);
             var area = new Rectangle(e.Bounds.X + 6, e.Bounds.Y, Math.Max(0, e.Bounds.Width - 8), e.Bounds.Height);
-            TextRenderer.DrawText(e.Graphics, combo.GetItemText(combo.Items[e.Index]), e.Font, area, SettingsTheme.Ink,
+            TextRenderer.DrawText(e.Graphics, combo.GetItemText(combo.Items[e.Index]), e.Font, area, combo.Enabled ? UiTheme.Ink : UiTheme.Muted,
                 TextFormatFlags.NoPadding | TextFormatFlags.SingleLine | TextFormatFlags.VerticalCenter | TextFormatFlags.EndEllipsis);
             if (!isSelection) e.DrawFocusRectangle();
         };
@@ -722,5 +875,6 @@ internal sealed class SettingsWindow : Form
     {
         if (disposing) { refresh.Dispose(); help.Dispose(); }
         base.Dispose(disposing);
+        if (disposing) { bodyFont.Dispose(); hintFont.Dispose(); titleFont.Dispose(); brandFont.Dispose(); }
     }
 }

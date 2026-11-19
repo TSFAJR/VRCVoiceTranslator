@@ -35,8 +35,7 @@ public sealed class BailianClient
     private async Task<string> RecognizeCoreAsync(Settings settings, IAsyncEnumerable<byte[]> audio,
         Action<RecognizedSentence>? onSentence, Action? onStarted, CancellationToken cancellation)
     {
-        if (string.IsNullOrWhiteSpace(settings.BailianApiKey)) throw new ServiceException("请填写百炼 API Key。");
-        if (!Settings.IsWebSocketEndpoint(settings.BailianEndpoint)) throw new ServiceException("请填写百炼工作空间的 WebSocket 地址。");
+        if (BailianEndpoints.ConfigurationError(settings) is { } error) throw new ServiceException(error);
 
         var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var finishing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -105,7 +104,7 @@ public sealed class BailianClient
         {
             socket.Options.SetRequestHeader("Authorization", $"Bearer {settings.BailianApiKey}");
             socket.Options.CollectHttpResponseDetails = true;
-            await socket.ConnectAsync(new Uri(settings.BailianEndpoint), cancellation).ConfigureAwait(false);
+            await socket.ConnectAsync(BailianEndpoints.Audio(settings), cancellation).ConfigureAwait(false);
             return socket;
         }
         catch (WebSocketException) when ((int)socket.HttpStatusCode > 0)

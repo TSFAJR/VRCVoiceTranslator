@@ -16,8 +16,7 @@ public sealed class BailianTtsClient(Func<Settings, CancellationToken, Task<WebS
     public async Task SynthesizeAsync(string text, Settings settings, Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask> receive,
         CancellationToken cancellation)
     {
-        if (string.IsNullOrWhiteSpace(settings.BailianApiKey) || !Settings.IsWebSocketEndpoint(settings.BailianEndpoint))
-            throw new ServiceException("请先保存百炼地址和 API Key。");
+        if (BailianEndpoints.ConfigurationError(settings) is { } configurationError) throw new ServiceException(configurationError);
         var mode = settings.Speech.SelectMode();
         if (string.IsNullOrWhiteSpace(mode.Voice)) throw new ServiceException("请填写当前播报模式的音色 ID。");
         if (string.IsNullOrWhiteSpace(text) || text.Length > 20000) throw new ServiceException("待播报文本为空或超过 20000 字符。");

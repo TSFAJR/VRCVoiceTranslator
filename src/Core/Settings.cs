@@ -6,10 +6,18 @@ namespace VrcTranslator;
 
 public enum VrBindingMode { Chord, TwoActions }
 public enum SourceLanguage { Chinese, English, Japanese, Korean, Auto }
+public enum AppearanceMode { System, Light, Dark }
+
+public enum TranslationProvider
+{
+    DeepL,
+    [JsonStringEnumMemberName("qwen-mt-flash")] QwenMtFlash,
+    [JsonStringEnumMemberName("qwen-mt-lite")] QwenMtLite
+}
 
 public sealed record Settings
 {
-    public const string DefaultEndpoint = "wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference";
+    public AppearanceMode Appearance { get; init; } = AppearanceMode.System;
     public string? MicrophoneId { get; init; }
     public string? IncomingPlaybackDeviceId { get; init; }
     public bool IncomingStrongerNoiseFilter { get; init; }
@@ -17,9 +25,11 @@ public sealed record Settings
     public VrBindingMode VrBinding { get; init; } = VrBindingMode.Chord;
     public bool ExperimentalVrInputOverride { get; init; }
     public int MaxRecordingSeconds { get; init; } = 12;
-    public string BailianEndpoint { get; init; } = DefaultEndpoint;
+    public string BailianWorkspaceId { get; init; } = "";
+    public BailianRegion BailianRegion { get; init; }
     public string BailianApiKey { get; init; } = "";
     public string DeepLApiKey { get; init; } = "";
+    public TranslationProvider TranslationProvider { get; init; }
     public SourceLanguage SourceLanguage { get; init; } = SourceLanguage.Chinese;
     public string[] TargetLanguages { get; init; } = ["EN-US", "JA"];
     public bool ChatboxEnabled { get; init; } = true;
@@ -29,30 +39,25 @@ public sealed record Settings
 
     public Settings Validate()
     {
+        if (!Enum.IsDefined(Appearance)) throw new FormatException("界面外观设置无效。");
         if (KeyboardVirtualKey is < 0x08 or > 0xFE) throw new FormatException("键盘虚拟键码超出范围。");
         if (!Enum.IsDefined(VrBinding) || !Enum.IsDefined(SourceLanguage)) throw new FormatException("输入模式或语音语言无效。");
+        if (!Enum.IsDefined(BailianRegion) || !Enum.IsDefined(TranslationProvider)) throw new FormatException("百炼地域或翻译服务无效。");
         if (MaxRecordingSeconds is < 1 or > 60) throw new FormatException("录音上限应为 1–60 秒。");
         if (OscPort is < 1 or > 65535) throw new FormatException("OSC 端口应为 1–65535。");
-        if (BailianEndpoint is null || BailianApiKey is null || DeepLApiKey is null || TargetLanguages is null || Subtitles is null || Speech is null)
+        if (BailianWorkspaceId is null || BailianApiKey is null || DeepLApiKey is null || TargetLanguages is null || Subtitles is null || Speech is null)
             throw new FormatException("必填配置字段不能为 null。");
-        string endpoint = BailianEndpoint.Trim();
-        if (endpoint != DefaultEndpoint && !IsWebSocketEndpoint(endpoint))
-            throw new FormatException("百炼地址必须是有效的 wss:// 地址。");
         string[] targets = TargetLanguages.Select(NormalizeTarget).Distinct(StringComparer.Ordinal).ToArray();
         Subtitles.Validate();
-        return this with { BailianEndpoint = endpoint, BailianApiKey = BailianApiKey.Trim(),
+        return this with { BailianWorkspaceId = BailianEndpoints.NormalizeWorkspaceId(BailianWorkspaceId), BailianApiKey = BailianApiKey.Trim(),
             DeepLApiKey = DeepLApiKey.Trim(), TargetLanguages = targets, Speech = Speech.Validate() };
     }
-
-    public static bool IsWebSocketEndpoint(string address) =>
-        Uri.TryCreate(address, UriKind.Absolute, out var uri) && uri.Scheme == "wss" &&
-        uri.Host.Length > 0 && uri.UserInfo.Length == 0 && uri.Fragment.Length == 0;
 
     public static string NormalizeTarget(string? language)
     {
         string code = language?.Trim().ToUpperInvariant() ?? "";
         if (!Regex.IsMatch(code, @"\A[A-Z]{2,3}(?:-[A-Z]{2,4})?\z", RegexOptions.CultureInvariant))
-            throw new FormatException("目标语言需使用 DeepL 语言代码，例如 EN-US 或 JA。");
+            throw new FormatException("请输入目标语言代码，例如 EN-US 或 JA。");
         return code;
     }
 }
@@ -125,8 +130,22 @@ public sealed class SettingsStore(string path)
         try
         {
             using var stream = File.OpenRead(Path);
-            return (JsonSerializer.Deserialize<Settings>(stream, JsonOptions) ??
-                throw new FormatException("配置的根必须是 JSON 对象。")).Validate();
+            using var document = JsonDocument.Parse(stream);
+            var root = document.RootElement;
+            if (root.ValueKind != JsonValueKind.Object) throw new FormatException("配置的根必须是 JSON 对象。");
+            var settings = root.Deserialize<Settings>(JsonOptions)!;
+            bool hasWorkspace = false, hasRegion = false;
+            string? previousEndpoint = null;
+            foreach (var property in root.EnumerateObject())
+            {
+                if (property.Name.Equals("bailianWorkspaceId", StringComparison.OrdinalIgnoreCase)) hasWorkspace = true;
+                if (property.Name.Equals("bailianRegion", StringComparison.OrdinalIgnoreCase)) hasRegion = true;
+                if (property.Name.Equals("bailianEndpoint", StringComparison.OrdinalIgnoreCase) && property.Value.ValueKind == JsonValueKind.String)
+                    previousEndpoint = property.Value.GetString();
+            }
+            if (!hasWorkspace && BailianEndpoints.ReadLegacyWorkspace(previousEndpoint) is { } legacy)
+                settings = settings with { BailianWorkspaceId = legacy.Id, BailianRegion = hasRegion ? settings.BailianRegion : legacy.Region };
+            return settings.Validate();
         }
         catch (Exception exception) when (exception is JsonException or FormatException)
         {

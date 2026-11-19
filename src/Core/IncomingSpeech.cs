@@ -5,10 +5,16 @@ namespace VrcTranslator;
 
 public sealed record IncomingTranslation(string Text, long RecognizedAt, long ReadyAt);
 
-public sealed class IncomingSpeech(Settings settings, BailianClient asr, DeepLClient deepL, Action<string> log)
+public sealed class IncomingSpeech(Settings settings, BailianClient asr, TranslationClient translator, Action<string> log,
+    Func<Settings>? currentSettings = null)
 {
     private static readonly TimeSpan TranslationDeadline = TimeSpan.FromSeconds(5);
-    private readonly Settings cloud = settings with { SourceLanguage = SourceLanguage.Auto, TargetLanguages = ["ZH-HANS"] };
+    private static readonly string[] IncomingTarget = ["ZH-HANS"];
+    private Settings CloudSettings() => (currentSettings?.Invoke() ?? settings) with
+    {
+        SourceLanguage = SourceLanguage.Auto, TargetLanguages = IncomingTarget,
+        IncomingStrongerNoiseFilter = settings.IncomingStrongerNoiseFilter
+    };
     private readonly Channel<PendingSentence> pending = Channel.CreateBounded<PendingSentence>(new BoundedChannelOptions(1)
     {
         SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.DropOldest
@@ -53,7 +59,7 @@ public sealed class IncomingSpeech(Settings settings, BailianClient asr, DeepLCl
             string failure;
             try
             {
-                await asr.StreamSentencesAsync(cloud, audio.ReadSpeechAsync(utterance, taskLifetime.Token), sentence =>
+                await asr.StreamSentencesAsync(CloudSettings(), audio.ReadSpeechAsync(utterance, taskLifetime.Token), sentence =>
                 {
                     if (cancellation.IsCancellationRequested) return;
                     recognized = true;
@@ -100,12 +106,14 @@ public sealed class IncomingSpeech(Settings settings, BailianClient asr, DeepLCl
             deadline.CancelAfter(remaining);
             try
             {
-                var batch = await deepL.TranslateAsync(sentence.Text, cloud, deadline.Token).ConfigureAwait(false);
+                var cloud = CloudSettings();
+                var batch = await translator.TranslateAsync(sentence.Text, cloud, deadline.Token).ConfigureAwait(false);
                 deadline.Token.ThrowIfCancellationRequested();
                 if (batch.Errors.Count > 0) { SetTranslationError(batch.Errors[0]); continue; }
                 Volatile.Write(ref translationError, null);
                 long now = Stopwatch.GetTimestamp();
-                if (batch.Results.FirstOrDefault() is not { } translation) Note("最近一句已是中文");
+                if (batch.Results.FirstOrDefault() is not { } translation)
+                    Note(batch.Notices.Count > 0 ? "译文与原文相同" : "最近一句已是中文");
                 else if (Stopwatch.GetElapsedTime(sentence.RecognizedAt, now) < TranslationDeadline)
                 {
                     Volatile.Write(ref outcome, null);

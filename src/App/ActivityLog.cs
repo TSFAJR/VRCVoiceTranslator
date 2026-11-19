@@ -4,6 +4,26 @@ internal sealed class ActivityLog(string path)
 {
     private readonly object guard = new();
 
+    public string ReadHistory()
+    {
+        // Take a consistent snapshot even if a writer is about to rotate the files.
+        lock (guard)
+        {
+            string previous = ReadFile(path + ".old");
+            string current = ReadFile(path);
+            return previous.Length > 0 && current.Length > 0 && !previous.EndsWith('\n')
+                ? previous + Environment.NewLine + current
+                : previous + current;
+        }
+    }
+
+    private static string ReadFile(string file)
+    {
+        try { return File.ReadAllText(file); }
+        catch (FileNotFoundException) { return ""; }
+        catch (DirectoryNotFoundException) { return ""; }
+    }
+
     public void Write(string message)
     {
         lock (guard)

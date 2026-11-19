@@ -12,6 +12,7 @@ internal sealed record DesktopStatus(VoicePhase Phase, string Vr, string Error, 
     public string IncomingStatus { get; init; } = "已关闭";
     public bool SpeechActive { get; init; }
     public string SpeechStatus { get; init; } = "待机";
+    public string TranslationNotice { get; init; } = "";
 }
 
 internal sealed partial class DesktopRuntime : IDisposable
@@ -28,7 +29,7 @@ internal sealed partial class DesktopRuntime : IDisposable
     private readonly BailianClient asr = new();
     private readonly BailianTtsClient tts = new();
     private readonly HttpClient http = new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = Timeout.InfiniteTimeSpan };
-    private readonly DeepLClient translate;
+    private readonly TranslationClient translate;
     private readonly ActivityLog log;
     private readonly SteamVr vr;
     private readonly Thread worker;
@@ -117,6 +118,7 @@ internal sealed partial class DesktopRuntime : IDisposable
             }
             if (batch.Errors.Count > 0)
                 ReportError(new ServiceException(string.Join("  ", batch.Errors)), "文字翻译");
+            ShowTranslationNotices(batch.Notices);
             result.SetResult(SendChatbox(() => Chatbox.FormatManual(original, batch.Results), port));
         });
         return await result.Task.WaitAsync(cancellation).ConfigureAwait(false);
@@ -217,7 +219,7 @@ internal sealed partial class DesktopRuntime : IDisposable
                 StopTest();
                 InterruptSpeech();
                 long generation = speechGeneration;
-                SetStatus(s => s with { Error = "" });
+                SetStatus(s => s with { Error = "", TranslationNotice = "" });
                 active = new RecordingSession(inputSettings, asr, translate, log.Write,
                     selection => QueueSpeech(selection, inputSettings, generation));
                 log.Write(gate.Owner == TriggerSource.Vr ? "手柄触发录音。" : "键盘触发录音。");
@@ -324,7 +326,7 @@ internal sealed partial class DesktopRuntime : IDisposable
         try
         {
             var current = Current with { IncomingPlaybackDeviceId = playbackDeviceId, IncomingStrongerNoiseFilter = strongerNoiseFilter };
-            incoming = IncomingListener.Start(current, asr, translate, log.Write);
+            incoming = IncomingListener.Start(current, asr, translate, log.Write, () => Current);
             SetIncomingStatus(true, "正在启动");
             log.Write("已开启来话翻译。");
         }
@@ -403,6 +405,7 @@ internal sealed partial class DesktopRuntime : IDisposable
         try
         {
             var take = finished.Work.GetAwaiter().GetResult();
+            ShowTranslationNotices(take.Notices);
             if (take.Errors.Count > 0)
             {
                 string error = string.Join("  ", take.Errors);
@@ -423,6 +426,13 @@ internal sealed partial class DesktopRuntime : IDisposable
         }
         catch (OperationCanceledException) { log.Write("录音已取消。"); }
         catch (Exception error) { ReportError(error, "语音处理"); }
+    }
+
+    private void ShowTranslationNotices(IReadOnlyList<string> notices)
+    {
+        string message = string.Join("  ", notices);
+        SetStatus(s => s with { TranslationNotice = message });
+        if (message.Length != 0) log.Write(message);
     }
 
     private bool SendChatbox(Func<string> format, int port)

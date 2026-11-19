@@ -9,9 +9,10 @@ internal sealed class IncomingListener : IDisposable
     private readonly IncomingSpeech speech;
     private int capturing;
 
-    private IncomingListener(Process target, Settings settings, BailianClient asr, DeepLClient deepL, Action<string> log)
+    private IncomingListener(Process target, Settings settings, BailianClient asr, TranslationClient translator, Action<string> log,
+        Func<Settings> currentSettings)
     {
-        speech = new(settings, asr, deepL, log);
+        speech = new(settings, asr, translator, log, currentSettings);
         Work = RunAsync(target, settings);
     }
 
@@ -21,12 +22,12 @@ internal sealed class IncomingListener : IDisposable
     public void Stop() => stop.Cancel();
     public void Dispose() => stop.Dispose();
 
-    public static IncomingListener Start(Settings settings, BailianClient asr, DeepLClient deepL, Action<string> log)
+    public static IncomingListener Start(Settings settings, BailianClient asr, TranslationClient translator, Action<string> log,
+        Func<Settings> currentSettings)
     {
         if (!settings.Subtitles.Enabled) throw new ServiceException("请先开启头显字幕并保存设置。");
-        if (string.IsNullOrWhiteSpace(settings.BailianApiKey) || !Settings.IsWebSocketEndpoint(settings.BailianEndpoint) ||
-            string.IsNullOrWhiteSpace(settings.DeepLApiKey))
-            throw new ServiceException("请先填写百炼地址、百炼 API Key 和 DeepL API Key 并保存设置。");
+        if ((BailianEndpoints.ConfigurationError(settings) ?? TranslationClient.ConfigurationError(settings)) is { } error)
+            throw new ServiceException(error);
 
         using var current = Process.GetCurrentProcess();
         var candidates = Process.GetProcessesByName("VRChat");
@@ -42,7 +43,7 @@ internal sealed class IncomingListener : IDisposable
                 if (!process.HasExited) selected = process;
             }
             if (selected is null) throw new ServiceException("请先启动 VRChat PC 版。");
-            var listener = new IncomingListener(selected, settings, asr, deepL, log);
+            var listener = new IncomingListener(selected, settings, asr, translator, log, currentSettings);
             foreach (var candidate in candidates)
                 if (candidate != selected) candidate.Dispose();
             return listener;
