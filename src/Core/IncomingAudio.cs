@@ -12,10 +12,12 @@ public sealed class IncomingAudio(bool strongerNoiseFilter = false)
     public const int FrameBytes = SampleRate * FrameMilliseconds / 1000 * sizeof(short);
     private const int OnsetFrames = 3;
     private const int LeadFrames = 300 / FrameMilliseconds + OnsetFrames - 1;
-    private const int TailFrames = 160 / FrameMilliseconds;
-    private const int IdleFrames = 5000 / FrameMilliseconds;
+    private const int TailMilliseconds = 160;
+    private const int TailFrames = TailMilliseconds / FrameMilliseconds;
     private const int TaskFrames = 10000 / FrameMilliseconds;
-    private static readonly TimeSpan MissingPacketTimeout = TimeSpan.FromMilliseconds(1200);
+    private static readonly TimeSpan PacketGrace = TimeSpan.FromMilliseconds(100);
+    private static readonly long PacketGraceTicks = Stopwatch.Frequency * PacketGrace.Ticks / TimeSpan.TicksPerSecond;
+    private static readonly long FrameTicks = Stopwatch.Frequency * FrameMilliseconds / 1000;
     private static readonly byte[] Silence = new byte[FrameBytes];
     private readonly int gateLevel = strongerNoiseFilter ? 260 : 130;
     private readonly Channel<Frame> frames = Channel.CreateBounded<Frame>(new BoundedChannelOptions(500)
@@ -33,19 +35,20 @@ public sealed class IncomingAudio(bool strongerNoiseFilter = false)
     internal async Task<Utterance> WaitForSpeechAsync(long capturedSince, CancellationToken cancellation)
     {
         var lead = new Queue<Frame>(LeadFrames);
-        long previous = 0;
+        Frame previous = default;
         int audible = 0;
         while (true)
         {
             cancellation.ThrowIfCancellationRequested();
             var frame = await frames.Reader.ReadAsync(cancellation).ConfigureAwait(false);
             if (frame.CapturedAt < capturedSince) continue;
-            if (previous + 1 != frame.Number)
+            if (previous.Number + 1 != frame.Number ||
+                Stopwatch.GetElapsedTime(previous.CapturedAt, frame.CapturedAt) > PacketGrace)
             {
                 lead.Clear();
                 audible = 0;
             }
-            previous = frame.Number;
+            previous = frame;
             audible = IsAudible(frame.Pcm) ? audible + 1 : 0;
             if (audible == OnsetFrames) return new(lead.ToArray(), frame);
             if (lead.Count == LeadFrames) lead.Dequeue();
@@ -53,30 +56,72 @@ public sealed class IncomingAudio(bool strongerNoiseFilter = false)
         }
     }
 
-    internal async IAsyncEnumerable<byte[]> ReadSpeechAsync(Utterance utterance, [EnumeratorCancellation] CancellationToken cancellation)
+    internal async IAsyncEnumerable<byte[]> ReadSpeechAsync(Utterance utterance, int sentenceSilenceMs,
+        [EnumeratorCancellation] CancellationToken cancellation)
     {
-        using var idle = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        // Give the server enough silence to finish the sentence before ending an idle session.
+        int idleMilliseconds = Math.Max(5000, sentenceSilenceMs + TailMilliseconds + FrameMilliseconds);
+        int idleFrames = (idleMilliseconds + FrameMilliseconds - 1) / FrameMilliseconds;
         foreach (var frame in utterance.Lead) yield return frame.Pcm;
         yield return utterance.FirstAudible.Pcm;
-        long previous = utterance.FirstAudible.Number;
+        int count = utterance.Lead.Length + 1;
         int silent = 0;
-        for (int count = utterance.Lead.Length + 1; count < TaskFrames && silent < IdleFrames; count++)
+        await foreach (var pcm in ReadTimedFramesAsync(utterance.FirstAudible, cancellation).ConfigureAwait(false))
         {
-            Frame next;
-            try
+            silent = IsAudible(pcm) ? 0 : silent + 1;
+            // Keep quiet syllable tails, then pass true silence so the server can recognize the pause.
+            yield return silent <= TailFrames ? pcm : Silence;
+            if (++count >= TaskFrames || silent >= idleFrames) yield break;
+        }
+    }
+
+    private async IAsyncEnumerable<byte[]> ReadTimedFramesAsync(Frame previous, [EnumeratorCancellation] CancellationToken cancellation)
+    {
+        using var waiting = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        Task<bool>? readable = null;
+        Task? clockTick = null;
+        int filled = 0;
+        try
+        {
+            while (true)
             {
                 cancellation.ThrowIfCancellationRequested();
-                idle.CancelAfter(MissingPacketTimeout);
-                next = await frames.Reader.ReadAsync(idle.Token).ConfigureAwait(false);
-                idle.CancelAfter(Timeout.InfiniteTimeSpan);
+                bool hasNext = frames.Reader.TryPeek(out var next);
+                if (hasNext && next.Number != previous.Number + 1) throw Backlog();
+
+                // Real frames carry their end time. While waiting, leave room for normal WASAPI batching.
+                long gapTicks = hasNext ? next.CapturedAt - previous.CapturedAt - FrameTicks
+                    : Stopwatch.GetTimestamp() - previous.CapturedAt - PacketGraceTicks;
+                long missing = (gapTicks + FrameTicks / 2) / FrameTicks;
+                while (filled < missing)
+                {
+                    cancellation.ThrowIfCancellationRequested();
+                    filled++;
+                    yield return Silence;
+                }
+                if (hasNext)
+                {
+                    // Peek keeps the first frame after a long pause in the channel if the task ends during padding.
+                    if (!frames.Reader.TryRead(out next) || next.Number != previous.Number + 1) throw Backlog();
+                    previous = next;
+                    filled = 0;
+                    yield return next.Pcm;
+                    continue;
+                }
+                readable ??= frames.Reader.WaitToReadAsync(waiting.Token).AsTask();
+                clockTick ??= Task.Delay(PacketGrace, waiting.Token);
+                await Task.WhenAny(readable, clockTick).ConfigureAwait(false);
+                if (readable.IsCompleted)
+                {
+                    if (!await readable.ConfigureAwait(false)) yield break;
+                    readable = null;
+                }
+                if (clockTick.IsCompleted) clockTick = null;
             }
-            catch (OperationCanceledException) when (!cancellation.IsCancellationRequested) { yield break; }
-            if (next.Number != previous + 1) throw new ServiceException("来话音频积压，已跳过当前片段。");
-            previous = next.Number;
-            silent = IsAudible(next.Pcm) ? 0 : silent + 1;
-            // Keep quiet syllable tails, then pass true silence so the server can recognize the pause.
-            yield return silent <= TailFrames ? next.Pcm : Silence;
         }
+        finally { waiting.Cancel(); }
+
+        static ServiceException Backlog() => new("来话音频积压，已跳过当前片段。");
     }
 
     private bool IsAudible(byte[] pcm)

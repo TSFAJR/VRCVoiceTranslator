@@ -45,7 +45,9 @@ internal sealed class RecordingSession : IDisposable
         int bytesLeft = limit;
         string original;
         long releasedAt;
-        var recognition = asr.RecognizeAsync(Settings, audio.Reader.ReadAllAsync(), recognitionLifetime.Token);
+        int corrections = 0;
+        var recognition = asr.RecognizeAsync(Settings, audio.Reader.ReadAllAsync(), recognitionLifetime.Token,
+            count => corrections = count);
         try
         {
             using (var cue = new RecordingCue())
@@ -94,14 +96,14 @@ internal sealed class RecordingSession : IDisposable
             catch (Exception) { /* The primary failure is reported by the recording task. */ }
         }
 
-        log($"松手或自动提交至最终原文：{Stopwatch.GetElapsedTime(releasedAt).TotalMilliseconds:F0} 毫秒");
+        log($"松手或自动提交至最终原文：{Stopwatch.GetElapsedTime(releasedAt).TotalMilliseconds:F0} 毫秒，纠错 {corrections} 次");
         if (string.IsNullOrWhiteSpace(original)) return new(null, [], []);
         cancelled.Token.ThrowIfCancellationRequested();
         Volatile.Write(ref phase, (int)VoicePhase.Translating);
         log("开始翻译。");
         long start = Stopwatch.GetTimestamp();
         var batch = await TakeTranslation.TranslateAsync(translator, original, Settings, announce, cancelled.Token).ConfigureAwait(false);
-        log($"原文至译文就绪：{Stopwatch.GetElapsedTime(start).TotalMilliseconds:F0} 毫秒，译文 {batch.Results.Count} 项");
+        log($"原文至译文就绪：{Stopwatch.GetElapsedTime(start).TotalMilliseconds:F0} 毫秒，译文 {batch.Results.Count} 项，术语 {batch.RequestedTermCount} 条");
         return new(new(original, batch.Results), batch.Errors, batch.Notices);
     }
 

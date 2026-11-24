@@ -50,8 +50,16 @@ internal static class IncomingLoopbackCapture
             {
                 while (!cancellation.IsCancellationRequested && capture.GetNextPacketSize() > 0)
                 {
-                    nint buffer = capture.GetBuffer(out int frames, out AudioClientBufferFlags flags);
-                    try { resampler.Write(buffer, frames, (flags & AudioClientBufferFlags.Silent) != 0); }
+                    nint buffer = capture.GetBuffer(out int frames, out AudioClientBufferFlags flags, out _, out long packetStart);
+                    try
+                    {
+                        // WASAPI reports the first sample's QPC position in 100 ns units.
+                        long endAt = packetStart > 0 && (flags & AudioClientBufferFlags.TimestampError) == 0
+                            ? (long)((Int128)packetStart * Stopwatch.Frequency / TimeSpan.TicksPerSecond) +
+                                frames * Stopwatch.Frequency / CaptureRate
+                            : Stopwatch.GetTimestamp();
+                        resampler.Write(buffer, frames, (flags & AudioClientBufferFlags.Silent) != 0, endAt);
+                    }
                     finally { capture.ReleaseBuffer(frames); }
                 }
             }
@@ -186,7 +194,7 @@ internal static class IncomingLoopbackCapture
             resampler.SetRates(CaptureRate, IncomingAudio.SampleRate);
         }
 
-        public unsafe void Write(nint buffer, int frames, bool silent)
+        public unsafe void Write(nint buffer, int frames, bool silent, long endAt)
         {
             int inputFrames = resampler.ResamplePrepare(frames, 1, out var input, out int offset);
             if (silent) Array.Clear(input, offset, inputFrames);
@@ -198,14 +206,13 @@ internal static class IncomingLoopbackCapture
             }
 
             int count = resampler.ResampleOut(samples, 0, inputFrames, samples.Length, 1);
-            long now = Stopwatch.GetTimestamp();
             for (int i = 0; i < count; i++)
             {
                 int value = Math.Clamp((int)(samples[i] * 32768), short.MinValue, short.MaxValue);
                 frame[filled++] = (byte)value;
                 frame[filled++] = (byte)(value >> 8);
                 if (filled < frame.Length) continue;
-                audio.Push(frame, now - (count - i - 1) * Stopwatch.Frequency / IncomingAudio.SampleRate);
+                audio.Push(frame, endAt - (count - i - 1) * Stopwatch.Frequency / IncomingAudio.SampleRate);
                 frame = new byte[IncomingAudio.FrameBytes];
                 filled = 0;
             }

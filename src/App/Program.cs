@@ -70,7 +70,7 @@ internal sealed class TranslatorTray : ApplicationContext
     private void ShowSettings()
     {
         settings.Show();
-        if (settings.WindowState == FormWindowState.Minimized) settings.WindowState = FormWindowState.Normal;
+        settings.RestoreFromMinimized();
         settings.Activate();
     }
 

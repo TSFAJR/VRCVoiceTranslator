@@ -15,9 +15,12 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Oculus Touch default left trigger and right grip", DefaultTouchBindings),
     ("Message ASR startup buffer, streaming, final events", AsrStreaming),
     ("Message ASR blank and auto language", AsrBlank),
+    ("ASR hotword payload respects saved words and the switch", AsrHotwords),
+    ("ASR context and final correction reach translation and parallel speech", AsrTerminology),
     ("Message ASR startup / final timeout and service failure", AsrErrors),
     ("Incoming ASR emits each final sentence before finish", IncomingAsrEvents),
     ("Incoming speech keeps the lead, closes on silence and resumes", IncomingSilenceAndResume),
+    ("Missing loopback packets and explicit silence produce identical ASR audio", IncomingPacketGap),
     ("Incoming filtering ignores noise spikes and rolls over continuous sound", IncomingNoiseAndLimit),
     ("Incoming speech drops queued older sentences and late results after stop", IncomingQueueAndStop),
     ("DeepL parallel target requests and configured order", DeepLOrdering),
@@ -25,7 +28,13 @@ var tests = new (string Name, Func<Task> Run)[]
     ("DeepL total failure and auto language filtering", DeepLFallback),
     ("Qwen-MT provider, regional HTTPS, language mapping and partial errors", QwenMtRequests),
     ("Qwen-MT target callback and translation deadline", QwenMtDeadline),
-    ("Incoming translation switches to Qwen-MT with auto detection and suppresses repeats", IncomingQwenTranslation),
+    ("Incoming translation uses the task snapshot and suppresses repeats", IncomingQwenTranslation),
+    ("Translation terms are bounded, matched per target, and omitted for DeepL", TranslationTerminology),
+    ("Literal corrections match whole English words and never cascade", TerminologyMatching),
+    ("Voice library restores old IDs and filters system voices", SpeechVoiceLibrary),
+    ("Speech keyword priority, boundaries, fixed tags and plain mode", SpeechKeywordMatching),
+    ("Speech tags stay out of translations, chatbox and subtitles", SpeechTagIsolation),
+    ("Live short utterance and preview share the ASMR synthesis instruction", LiveSpeechDirection),
     ("TTS WebSocket modes, event sequence and streaming PCM", TtsProtocol),
     ("TTS service failure, timeout and discarded late PCM", TtsErrorsAndCancel),
     ("Original TTS precedes and survives DeepL failure", SpeechOriginalParallel),
@@ -33,8 +42,11 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Chatbox sample via real UDP and Unicode clipping", ChatboxPacket),
     ("Manual Chatbox text preserves line breaks and room for translations", ManualChatboxPacket),
     ("Subtitle replacement, new expiry and empty translation", SubtitleTiming),
-    ("Outgoing subtitle takes priority and expired incoming stays hidden", IncomingSubtitleTiming),
+    ("Overlay retry preserves fresh subtitles and discards expired ones", SubtitleRetryTiming),
+    ("Incoming subtitle keeps the latest complete sentence and respects outgoing priority", IncomingSubtitleTiming),
     ("Settings defaults, save, external edit and malformed preservation", ConfigRoundTrip),
+    ("Window resize persists independently and preserves external settings", WindowLayoutPersistence),
+    ("Hotword text import validates terms and weights", HotwordImport),
     ("Bailian Workspace ID endpoints and legacy migration", WorkspaceMigration)
 };
 int failures = 0;
@@ -202,6 +214,99 @@ static async Task AsrBlank()
     Equal("", await work);
 }
 
+static async Task AsrHotwords()
+{
+    var configured = CloudSettings() with
+    {
+        RecognitionHotwords = RecognitionVocabulary.ParseLines(["桔梗", "The Black Cat\t2", "Kipfel\t50"])
+    };
+
+    foreach (var settings in new[] { CloudSettings(), configured, configured with { RecognitionHotwordsEnabled = false } })
+    {
+        using var socket = new FakeSocket();
+        var logs = new List<string>();
+        var client = new BailianClient((_, _) => Task.FromResult<WebSocket>(socket), log: logs.Add);
+        var work = client.RecognizeAsync(settings, AsyncEnumerable.Empty<byte[]>(), CancellationToken.None);
+        using var run = JsonDocument.Parse(await socket.SentText());
+        string id = run.RootElement.GetProperty("header").GetProperty("task_id").GetString()!;
+        var payload = run.RootElement.GetProperty("payload");
+        Equal("{}", payload.GetProperty("input").GetRawText());
+        var parameters = payload.GetProperty("parameters");
+        bool hasHotwords = parameters.TryGetProperty("vocabulary", out var hotwords);
+        Equal(settings.RecognitionHotwordsEnabled && settings.RecognitionHotwords.Count > 0, hasHotwords);
+        if (hasHotwords)
+        {
+            Equal(4, hotwords.GetProperty("桔梗").GetInt32());
+            Equal(2, hotwords.GetProperty("The Black Cat").GetInt32());
+            Equal(50, hotwords.GetProperty("Kipfel").GetInt32());
+        }
+        Equal(0, logs.Count);
+        socket.Event("task-started", id);
+        _ = await socket.SentText();
+        socket.Event("task-finished", id);
+        Equal("", await work);
+        Equal(hasHotwords ? "麦克风识别任务已启动 · 请求附带热词 3 条（加强 1 条），上下文无。"
+            : "麦克风识别任务已启动 · 请求附带热词 0 条（加强 0 条），上下文无。", logs.Single());
+    }
+}
+
+static async Task AsrTerminology()
+{
+    using var socket = new FakeSocket();
+    using var stop = new CancellationTokenSource(TimeSpan.FromSeconds(4));
+    const string context = "在 VRChat 里，全追是全身追踪的简称。";
+    const string corrected = "你用的是什么全追？";
+    var settings = CloudSettings() with
+    {
+        TargetLanguages = ["EN-US"], TranslationProvider = TranslationProvider.QwenMtFlash,
+        Speech = new() { Enabled = true },
+        Terminology = new(context, [new("什么全锥", "什么全追")], [new("全追", "EN-US", "full-body tracking")])
+    };
+    int count = 0;
+    int connections = 0;
+    var events = new List<string>();
+    var asr = new BailianClient((_, _) => { connections++; return Task.FromResult<WebSocket>(socket); }, log: events.Add);
+    var work = asr.RecognizeAsync(settings, AsyncEnumerable.Empty<byte[]>(), stop.Token, hits => count = hits);
+    using var run = JsonDocument.Parse(await socket.SentText());
+    string id = run.RootElement.GetProperty("header").GetProperty("task_id").GetString()!;
+    var hint = run.RootElement.GetProperty("payload").GetProperty("input").GetProperty("context").EnumerateArray().Single();
+    Equal("user", hint.GetProperty("role").GetString());
+    var content = hint.GetProperty("content").EnumerateArray().Single();
+    Equal("input_text", content.GetProperty("type").GetString());
+    Equal(context, content.GetProperty("text").GetString());
+    socket.Event("task-started", id);
+    using var finish = JsonDocument.Parse(await socket.SentText());
+    Equal("finish-task", finish.RootElement.GetProperty("header").GetProperty("action").GetString());
+    Equal("{}", finish.RootElement.GetProperty("payload").GetProperty("input").GetRawText());
+    socket.Sentence(id, 1, "这条中间结果不应使用", end: false);
+    socket.Sentence(id, 2, "全锥？", end: true);
+    socket.Sentence(id, 1, "你用的是什么", end: true);
+    socket.Event("task-finished", id);
+    string original = await work;
+    Equal(corrected, original);
+    Equal(1, count);
+    Equal(1, connections);
+    True(events.Single().EndsWith("上下文已附带。") && !events.Single().Contains(context));
+
+    var requests = Channel.CreateUnbounded<string>();
+    var pending = new TaskCompletionSource<HttpResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+    using var http = FakeHttp(async (request, token) =>
+    {
+        await requests.Writer.WriteAsync(await request.Content!.ReadAsStringAsync(token), token);
+        return await pending.Task.WaitAsync(token);
+    });
+    var speech = Channel.CreateUnbounded<SpeechSelection>();
+    var translation = TakeTranslation.TranslateAsync(new(http), original, settings, selection => speech.Writer.TryWrite(selection), stop.Token);
+    Equal(new SpeechSelection(corrected, null), await speech.Reader.ReadAsync(stop.Token));
+    using var body = JsonDocument.Parse(await requests.Reader.ReadAsync(stop.Token));
+    Equal(corrected, body.RootElement.GetProperty("messages")[0].GetProperty("content").GetString());
+    Equal("full-body tracking", body.RootElement.GetProperty("translation_options").GetProperty("terms")[0].GetProperty("target").GetString());
+    True(!translation.IsCompleted);
+    pending.SetResult(MtResponse("Which full-body tracking setup do you use?"));
+    Equal(1, (await translation).RequestedTermCount);
+    True(!requests.Reader.TryRead(out _));
+}
+
 static async Task AsrErrors()
 {
     using var neverStarts = new FakeSocket();
@@ -266,45 +371,129 @@ static async Task IncomingSilenceAndResume()
     int connections = 0;
     var asr = new BailianClient((_, _) => Task.FromResult<WebSocket>(Interlocked.Increment(ref connections) == 1 ? first : second));
     var logs = new List<string>();
-    var speech = new IncomingSpeech(CloudSettings(), asr, new TranslationClient(http), logs.Add);
+    var current = CloudSettings() with { RecognitionHotwords = RecognitionVocabulary.ParseLines(["桔梗"]), Terminology = new("初始语料") };
+    var speech = new IncomingSpeech(current, asr, new TranslationClient(http), logs.Add, () => Volatile.Read(ref current));
     var feed = new IncomingAudio();
     var work = speech.RunAsync(feed, stop.Token);
     var quiet = PcmFrame(35);
     var audible = PcmFrame(2000);
-    for (int i = 0; i < 20; i++) feed.Push(quiet, Stopwatch.GetTimestamp());
+    long frameStep = Stopwatch.Frequency * IncomingAudio.FrameMilliseconds / 1000;
+    long capturedAt = Stopwatch.GetTimestamp() - 273 * frameStep;
+    void QueuePcm(byte[] pcm, int count)
+    {
+        for (int i = 0; i < count; i++) feed.Push(pcm, capturedAt += frameStep);
+    }
+    QueuePcm(quiet, 20);
     True(!first.HasOutgoing);
-    PushIncomingFrames(feed, audible, 3);
+    QueuePcm(audible, 3);
+    // These are contiguous capture frames, even if the simulated translator runs slowly.
+    QueuePcm(quiet, 250);
     using var run = JsonDocument.Parse(await first.SentText());
     string id = run.RootElement.GetProperty("header").GetProperty("task_id").GetString()!;
     var parameters = run.RootElement.GetProperty("payload").GetProperty("parameters");
     True(!parameters.TryGetProperty("language_hints", out _));
-    Equal(500, parameters.GetProperty("max_sentence_silence").GetInt32());
+    Equal(300, parameters.GetProperty("max_sentence_silence").GetInt32());
     True(!parameters.TryGetProperty("speech_noise_threshold", out _));
+    Equal(4, parameters.GetProperty("vocabulary").GetProperty("桔梗").GetInt32());
+    Equal("初始语料", run.RootElement.GetProperty("payload").GetProperty("input").GetProperty("context")[0]
+        .GetProperty("content")[0].GetProperty("text").GetString());
     first.Event("task-started", id);
     string quietPacket = Convert.ToHexString(quiet.Concat(quiet).Concat(quiet).Concat(quiet).Concat(quiet).ToArray());
     for (int i = 0; i < 3; i++) Equal((WebSocketMessageType.Binary, quietPacket), await first.SentHex());
     first.Sentence(id, 1, "こんにちは！", end: true, endTime: 320);
     IncomingTranslation? translated = null;
-    while ((translated = speech.TakeLatest()) is null) await Task.Delay(10);
+    while ((translated = speech.TakeNext()) is null) await Task.Delay(10);
     Equal("你好！", translated.Text);
     True(logs.Single().StartsWith("来话句末至识别"));
-    for (int i = 0; i < 250; i++) feed.Push(quiet, Stopwatch.GetTimestamp());
     byte[] lastVoice = [.. audible, .. audible, .. audible, .. quiet, .. quiet];
     Equal((WebSocketMessageType.Binary, Convert.ToHexString(lastVoice)), await first.SentHex());
     Equal((WebSocketMessageType.Binary, quietPacket), await first.SentHex());
     byte[] filteredTail = [.. quiet, .. new byte[4 * IncomingAudio.FrameBytes]];
     True((await first.SentHex()) == (WebSocketMessageType.Binary, Convert.ToHexString(filteredTail)));
     await FinishIncoming(first, id);
-    for (int i = 0; i < 10; i++) feed.Push(quiet, Stopwatch.GetTimestamp());
-    PushIncomingFrames(feed, audible, 3);
-    string nextId = await second.TaskId();
+    Volatile.Write(ref current, current with
+    {
+        RecognitionHotwords = RecognitionVocabulary.ParseLines(["The Black Cat\t3"]),
+        IncomingSentenceSilenceMs = 200, Terminology = new("新的语料")
+    });
+    capturedAt = Stopwatch.GetTimestamp() - 13 * frameStep;
+    QueuePcm(quiet, 10);
+    QueuePcm(audible, 3);
+    using var nextRun = JsonDocument.Parse(await second.SentText());
+    string nextId = nextRun.RootElement.GetProperty("header").GetProperty("task_id").GetString()!;
+    var nextParameters = nextRun.RootElement.GetProperty("payload").GetProperty("parameters");
+    Equal(200, nextParameters.GetProperty("max_sentence_silence").GetInt32());
+    var nextVocabulary = nextParameters.GetProperty("vocabulary");
+    Equal(3, nextVocabulary.GetProperty("The Black Cat").GetInt32());
+    True(!nextVocabulary.TryGetProperty("桔梗", out _));
+    Equal("新的语料", nextRun.RootElement.GetProperty("payload").GetProperty("input").GetProperty("context")[0]
+        .GetProperty("content")[0].GetProperty("text").GetString());
     True(nextId != id);
     Equal(2, connections);
     second.Event("task-started", nextId);
     // The Windows endpoint can stop delivering packets during a natural pause.
-    True(await FinishIncoming(second, nextId).WaitAsync(TimeSpan.FromSeconds(3)) > 0);
+    Equal((10 + 3 + 250) * IncomingAudio.FrameBytes, await FinishIncoming(second, nextId).WaitAsync(TimeSpan.FromSeconds(7)));
     stop.Cancel();
     _ = await ThrowsAsync<OperationCanceledException>(() => work);
+}
+
+static async Task IncomingPacketGap()
+{
+    var firstVoice = PcmFrame(2000);
+    var secondVoice = PcmFrame(4000);
+    var silence = PcmFrame(0);
+    const int idleFrames = 309; // 6 s plus the 160 ms tail and one frame.
+    foreach (string delivery in new[] { "silence packets", "buffered gap", "live gap" })
+    {
+        using var socket = new FakeSocket();
+        using var stop = new CancellationTokenSource();
+        using var http = FakeHttp((_, _) => throw new InvalidOperationException("Blank ASR should not translate."));
+        var asr = new BailianClient((_, _) => Task.FromResult<WebSocket>(socket));
+        var speech = new IncomingSpeech(CloudSettings() with { IncomingSentenceSilenceMs = 6000 }, asr, new TranslationClient(http), _ => { });
+        var feed = new IncomingAudio();
+        long step = Stopwatch.Frequency * IncomingAudio.FrameMilliseconds / 1000;
+        long at = Stopwatch.GetTimestamp() - 5 * step;
+        void Push(byte[] pcm, int count)
+        {
+            for (int i = 0; i < count; i++) feed.Push(pcm, at += step);
+        }
+        Push(firstVoice, 5);
+        var work = speech.RunAsync(feed, stop.Token);
+        string id = await socket.TaskId();
+        socket.Event("task-started", id);
+        using var received = new MemoryStream();
+        int gapFrames = 75;
+        if (delivery == "live gap")
+        {
+            // Observe actual silence being streamed, past the former 1.2 s cutoff, then resume.
+            while (received.Length < (5 + 75) * IncomingAudio.FrameBytes)
+            {
+                var (type, hex) = await socket.SentHex();
+                Equal(WebSocketMessageType.Binary, type);
+                received.Write(Convert.FromHexString(hex));
+            }
+            gapFrames = (int)((Stopwatch.GetTimestamp() - at) / step);
+        }
+        if (delivery == "silence packets") Push(silence, gapFrames);
+        else at += gapFrames * step;
+        Push(secondVoice, 5);
+        Push(silence, idleFrames);
+        while (true)
+        {
+            var (type, hex) = await socket.SentHex();
+            if (type == WebSocketMessageType.Binary) { received.Write(Convert.FromHexString(hex)); continue; }
+            using var command = JsonDocument.Parse(Convert.FromHexString(hex));
+            Equal("finish-task", command.RootElement.GetProperty("header").GetProperty("action").GetString());
+            break;
+        }
+        var expected = Enumerable.Repeat(firstVoice, 5).Concat(Enumerable.Repeat(silence, gapFrames))
+            .Concat(Enumerable.Repeat(secondVoice, 5)).Concat(Enumerable.Repeat(silence, idleFrames))
+            .SelectMany(frame => frame).ToArray();
+        True(expected.AsSpan().SequenceEqual(received.ToArray()));
+        socket.Event("task-finished", id);
+        stop.Cancel();
+        _ = await ThrowsAsync<OperationCanceledException>(() => work);
+    }
 }
 
 static async Task IncomingNoiseAndLimit()
@@ -374,11 +563,11 @@ static async Task IncomingQueueAndStop()
     _ = await second.TaskId();
     slow.SetResult(TranslationResponse("EN", "第一句"));
     Equal("Newest", await requests.Reader.ReadAsync());
-    Equal("第一句", speech.TakeLatest()?.Text);
+    Equal("第一句", speech.TakeNext()?.Text);
     stop.Cancel();
     _ = await ThrowsAsync<OperationCanceledException>(() => work);
     late.SetResult(TranslationResponse("EN", "迟到的译文"));
-    Equal<IncomingTranslation?>(null, speech.TakeLatest());
+    Equal<IncomingTranslation?>(null, speech.TakeNext());
     True(!requests.Reader.TryRead(out _));
 }
 
@@ -571,9 +760,20 @@ static async Task IncomingQwenTranslation()
         Equal("auto", options.GetProperty("source_lang").GetString());
         Equal("zh", options.GetProperty("target_lang").GetString());
         string? input = body.RootElement.GetProperty("messages")[0].GetProperty("content").GetString();
-        return MtResponse(input == "Hello" ? "你好" : "早上好");
+        if (input == "早上好")
+        {
+            True(!options.TryGetProperty("terms", out _));
+            return MtResponse("早上好");
+        }
+        Equal("Hello", input);
+        Equal("你好", options.GetProperty("terms")[0].GetProperty("target").GetString());
+        return MtResponse("你好");
     });
-    Settings current = CloudSettings() with { DeepLApiKey = "" };
+    Settings current = CloudSettings() with
+    {
+        DeepLApiKey = "", TranslationProvider = TranslationProvider.QwenMtLite,
+        Terminology = new(corrections: [new("Hullo", "Hello")], terms: [new("Hello", "ZH-HANS", "你好")])
+    };
     var asr = new BailianClient((_, _) => Task.FromResult<WebSocket>(socket));
     var speech = new IncomingSpeech(current, asr, new TranslationClient(http), _ => { }, () => Volatile.Read(ref current));
     var feed = new IncomingAudio();
@@ -581,34 +781,221 @@ static async Task IncomingQwenTranslation()
     PushIncomingFrames(feed, PcmFrame(2400), 3);
     string id = await socket.TaskId();
     socket.Event("task-started", id);
-    Volatile.Write(ref current, current with { TranslationProvider = TranslationProvider.QwenMtLite });
+    Volatile.Write(ref current, current with { TranslationProvider = TranslationProvider.QwenMtFlash, Terminology = new() });
     socket.Sentence(id, 1, "早上好", end: true);
     while (!speech.Status.Contains("译文与原文相同")) await Task.Delay(10, stop.Token);
-    Equal<IncomingTranslation?>(null, speech.TakeLatest());
-    socket.Sentence(id, 2, "Hello", end: true);
+    Equal<IncomingTranslation?>(null, speech.TakeNext());
+    socket.Sentence(id, 2, "Hullo", end: true);
     IncomingTranslation? translation;
-    while ((translation = speech.TakeLatest()) is null) await Task.Delay(10, stop.Token);
+    while ((translation = speech.TakeNext()) is null) await Task.Delay(10, stop.Token);
     Equal("你好", translation.Text);
     stop.Cancel();
     _ = await ThrowsAsync<OperationCanceledException>(() => work);
 }
 
+static async Task TranslationTerminology()
+{
+    var terms = Enumerable.Range(0, 10).Select(index => new TranslationTerm($"术语{index}", "EN-US", $"term {index}")).ToList();
+    terms.AddRange([new("全追", "JA", "フルトラ"), new("没出现", "JA", "未使用"), new("全追", "EN-GB", "not US")]);
+    string input = "全追" + string.Join(' ', terms.Take(10).Select(term => term.Source));
+    foreach (var provider in new[] { TranslationProvider.QwenMtFlash, TranslationProvider.QwenMtLite, TranslationProvider.DeepL })
+    {
+        using var http = FakeHttp(async (request, token) =>
+        {
+            using var json = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(token));
+            if (provider == TranslationProvider.DeepL)
+            {
+                Equal(input, json.RootElement.GetProperty("text")[0].GetString());
+                True(!json.RootElement.TryGetProperty("terms", out _));
+                Equal(3, json.RootElement.EnumerateObject().Count());
+                return TranslationResponse("ZH", "DeepL translation");
+            }
+            var options = json.RootElement.GetProperty("translation_options");
+            var sent = options.GetProperty("terms").EnumerateArray().ToArray();
+            if (options.GetProperty("target_lang").GetString() == "ja")
+            {
+                Equal("全追", sent.Single().GetProperty("source").GetString());
+                Equal("フルトラ", sent.Single().GetProperty("target").GetString());
+            }
+            else
+            {
+                Equal(8, sent.Length);
+                True(sent.All(item => item.GetProperty("source").GetString()!.StartsWith("术语")));
+            }
+            return MtResponse("Qwen translation");
+        });
+        var batch = await new TranslationClient(http).TranslateAsync(input,
+            CloudSettings() with { Terminology = new(terms: terms), TranslationProvider = provider }, CancellationToken.None);
+        Equal(0, batch.Errors.Count);
+        Equal(2, batch.Results.Count);
+        Equal(provider == TranslationProvider.DeepL ? 0 : 9, batch.RequestedTermCount);
+    }
+}
+
+static Task TerminologyMatching()
+{
+    var options = new TerminologySettings("  示例\r\n语料  ",
+        [new("全锥", "全追"), new("什么全锥", "哪种全追"), new("全追", "全身追踪"), new("Keepful", "Kipfel")],
+        [new("Kipfel", "ja", "キプフェル")]);
+    Equal("示例\n语料", options.Context);
+    Equal("圆锥、哪种全追、全追、全身追踪。xKeepful Keepful_01，模型Kipfel。",
+        options.Correct("圆锥、什么全锥、全锥、全追。xKeepful Keepful_01，模型KEEPFUL。", out int hits));
+    Equal(4, hits);
+    Equal(0, options.MatchTerms("Kipfel2", "JA").Count);
+    Equal(1, options.MatchTerms("Kipfel2、用Kipfel吧", "JA").Count);
+    Equal(0, options.MatchTerms("Kipfel", "EN-US").Count);
+    Equal(200, new TerminologySettings(string.Concat(Enumerable.Repeat("😀", 200))).Context.EnumerateRunes().Count());
+    _ = Throws<FormatException>(() => new TerminologySettings(new string('字', 201)));
+    _ = Throws<FormatException>(() => new TerminologySettings(corrections: [new("Kip", "甲"), new("kip", "乙")]));
+    _ = Throws<FormatException>(() => new TerminologySettings(terms: [new("相同", "ja", "甲"), new("相同", "JA", "乙")]));
+    return Task.CompletedTask;
+}
+
+static Task SpeechVoiceLibrary()
+{
+    var speech = new SpeechSettings
+    {
+        ChineseVoice = "  my-voice  ",
+        JapaneseVoice = "old-japanese",
+        VoiceAliases = new Dictionary<string, string>
+        {
+            [" Abby_v3.1 "] = " 英文女声 ",
+            ["spare-voice"] = "备用"
+        }
+    }.Validate();
+
+    var library = speech.Voices!;
+    Equal("my-voice", speech.SelectMode().Voice);
+    Equal("", library.Single(voice => voice.Id == "my-voice").Alias);
+    Equal("", library.Single(voice => voice.Id == "old-japanese").Alias);
+    Equal("英文女声", library.Single(voice => voice.Id == "Abby_v3.1").Alias);
+    True(library.All(voice => voice.Id != "abby_v3.1"));
+    True(speech.VoiceAliases is null);
+
+    var updated = speech with
+    {
+        ChineseVoice = "yuxiaoyun_v3.1",
+        JapaneseVoice = "spare-voice",
+        Voices = library.Where(voice => voice.Id != "yuxiaoyun_v3.1")
+            .Select(voice => voice.Id == "spare-voice" ? voice with { Languages = SpeechVoiceLanguages.English } : voice)
+            .ToArray()
+    };
+    updated = updated.Validate();
+    Equal("", updated.ChineseVoice);
+    Equal("", updated.JapaneseVoice);
+    library = updated.Voices!;
+    True(library.Any(voice => voice.Id == "my-voice"));
+    True(library.All(voice => voice.Id != "yuxiaoyun_v3.1"));
+
+    var chinese = SpeechVoiceCatalog.Choices(SpeechMode.ChineseOriginal, BailianRegion.Beijing, "", library);
+    True(chinese.Any(choice => choice.Id == "anmingyuan_v3.1"));
+    True(chinese.All(choice => choice.Id != "Abby_v3.1"));
+    var english = SpeechVoiceCatalog.Choices(SpeechMode.EnglishTranslation, BailianRegion.Singapore, "", library);
+    Equal("英文女声", english.Single(choice => choice.Id == "Abby_v3.1").Alias);
+    True(english.Any(choice => choice.Id == "spare-voice"));
+    True(english.All(choice => choice.Id != "loongbella_v3.1"));
+    var japanese = SpeechVoiceCatalog.Choices(SpeechMode.JapaneseTranslation, BailianRegion.Singapore, "", library);
+    True(japanese.Any(choice => choice.Id == SpeechSettings.DefaultJapaneseVoice));
+    True(japanese.All(choice => choice.Id != "spare-voice"));
+    Equal(0, (updated with { Voices = [] }).Validate().Voices!.Count);
+    _ = Throws<FormatException>(() => (updated with
+    {
+        Voices = [new("invalid", "", SpeechVoiceLanguages.None)]
+    }).Validate());
+    return Task.CompletedTask;
+}
+
+static Task SpeechKeywordMatching()
+{
+    var options = new SpeechSettings { Keywords = [new("GO", "excited"), new("走吧", "whispers"), new("一起走吧", "giggles")] };
+    string Format(string text) => SpeechExpression.Select(options, text, "spoken").Text!;
+    Equal("spoken", Format("goal?"));
+    Equal("[excited]spoken", Format("goal 再 go!"));
+    Equal("[whispers]spoken", Format("走吧，GO"));
+    Equal("[giggles]spoken", Format("Go! 走吧，我们一起走吧"));
+    Equal("spoken", Format("!?"));
+    Equal("spoken", SpeechExpression.Select(options with { Expression = SpeechExpression.Plain }, "走吧", "spoken").Text);
+    Equal("[curious]spoken", SpeechExpression.Select(options with { Expression = "curious" }, "走吧", "spoken").Text);
+    string full = new('好', BailianTtsClient.MaxTextLength);
+    Equal(full, SpeechExpression.Select(options, "走吧", full).Text);
+    _ = Throws<FormatException>(() => (options with { Rate = 2.01m }).Validate());
+    _ = Throws<FormatException>(() => (options with { Expression = "unlisted" }).Validate());
+    _ = Throws<FormatException>(() => SpeechExpression.ValidateRules([new("?!", "excited")]));
+    _ = Throws<FormatException>(() => SpeechExpression.ValidateRules([new("Great", "excited"), new(" great ", "sad")]));
+    _ = Throws<FormatException>(() => SpeechExpression.ValidateRules([new("great", "unlisted")]));
+    return Task.CompletedTask;
+}
+
+static async Task SpeechTagIsolation()
+{
+    const string original = "太好了，终于连上了！";
+    foreach (var mode in Enum.GetValues<SpeechMode>())
+    {
+        var speech = new SpeechSettings { Enabled = true, Mode = mode };
+        string target = speech.SelectMode().Target ?? "EN-US";
+        string translated = target == "JA" ? "やっとつながった！" : "We're finally connected!";
+        int requestCount = 0;
+        using var http = FakeHttp(async (request, token) =>
+        {
+            Interlocked.Increment(ref requestCount);
+            using var json = JsonDocument.Parse(await request.Content!.ReadAsStringAsync(token));
+            Equal(original, json.RootElement.GetProperty("text")[0].GetString());
+            return TranslationResponse("ZH", translated);
+        });
+        var selections = new List<SpeechSelection>();
+        var settings = CloudSettings() with { Speech = speech, TargetLanguages = [target] };
+        var batch = await TakeTranslation.TranslateAsync(new(http), original, settings, selections.Add, CancellationToken.None);
+        Equal(1, requestCount);
+        Equal("[excited]" + (mode == SpeechMode.ChineseOriginal ? original : translated), selections.Single().Text);
+        var visible = new VoiceResult(original, batch.Results);
+        Equal(original + "\n" + translated, SubtitlePresentation.Text(visible, true));
+        Equal(original + "\n" + translated, Chatbox.Format(visible));
+        Equal(original + "\n" + translated, Chatbox.FormatManual(original, batch.Results));
+    }
+}
+
+static async Task LiveSpeechDirection()
+{
+    var settings = CloudSettings() with { TargetLanguages = [], Speech = new() { Enabled = true, Expression = "asmr" } };
+    using var http = FakeHttp((_, _) => throw new Exception("No translation targets expected"));
+    var selections = new List<SpeechSelection>();
+    await TakeTranslation.TranslateAsync(new(http), "中午好。", settings, selections.Add, CancellationToken.None);
+    var live = selections.Single();
+    Equal("[asmr]中午好。", live.Text);
+    Equal(settings.Speech.PreviewSpeech().Tag, live.Tag);
+
+    using var socket = new FakeSocket();
+    var client = new BailianTtsClient((_, _) => Task.FromResult<WebSocket>(socket));
+    var work = client.SynthesizeAsync(live.Text!, settings, (_, _) => ValueTask.CompletedTask, CancellationToken.None, live.Tag);
+    using var run = JsonDocument.Parse(await socket.SentText());
+    string instruction = run.RootElement.GetProperty("payload").GetProperty("parameters").GetProperty("instruction").GetString()!;
+    True(instruction.Contains("中文") && instruction.Contains("气声"));
+    string id = run.RootElement.GetProperty("header").GetProperty("task_id").GetString()!;
+    socket.Event("task-started", id);
+    await CheckTtsSend(socket, id, live.Text!);
+    socket.Binary([1, 2]);
+    socket.Event("task-finished", id);
+    await work;
+}
+
 static async Task TtsProtocol()
 {
-    foreach (var (mode, voice, lang) in new[]
+    foreach (var (mode, voice, lang, rate, expression, prefix) in new[]
     {
-        (SpeechMode.ChineseOriginal, SpeechSettings.DefaultCustomVoice, "zh"),
-        (SpeechMode.EnglishTranslation, "custom-english", "en"),
-        (SpeechMode.JapaneseTranslation, SpeechSettings.DefaultJapaneseVoice, "ja")
+        (SpeechMode.ChineseOriginal, SpeechSettings.DefaultCustomVoice, "zh", 0.50m, SpeechExpression.Plain, ""),
+        (SpeechMode.EnglishTranslation, "custom-english", "en", 1m, SpeechExpression.Auto, "[excited]"),
+        (SpeechMode.JapaneseTranslation, SpeechSettings.DefaultJapaneseVoice, "ja", 2m, "giggles", "[giggles]")
     })
     {
         using var socket = new FakeSocket();
         var blocks = Channel.CreateUnbounded<byte[]>();
-        var options = new SpeechSettings { Mode = mode, EnglishVoice = "custom-english" };
-        string original = options.SelectMode().SampleText + new string('語', 170);
+        var options = new SpeechSettings { Mode = mode, EnglishVoice = "custom-english", Rate = rate, Expression = expression };
+        var preview = options.PreviewSpeech();
+        string original = preview.Text + new string('語', 170);
+        Equal(prefix + options.SelectMode().SampleText, preview.Text);
         var tts = new BailianTtsClient((_, _) => Task.FromResult<WebSocket>(socket));
         var work = tts.SynthesizeAsync(original, CloudSettings() with { Speech = options },
-            (pcm, token) => blocks.Writer.WriteAsync(pcm.ToArray(), token), CancellationToken.None);
+            (pcm, token) => blocks.Writer.WriteAsync(pcm.ToArray(), token), CancellationToken.None, preview.Tag);
         using var run = JsonDocument.Parse(await socket.SentText());
         var header = run.RootElement.GetProperty("header");
         var payload = run.RootElement.GetProperty("payload");
@@ -624,6 +1011,9 @@ static async Task TtsProtocol()
         Equal("PlainText", parameters.GetProperty("text_type").GetString());
         Equal("pcm", parameters.GetProperty("format").GetString());
         Equal(24000, parameters.GetProperty("sample_rate").GetInt32());
+        Equal(rate, parameters.GetProperty("rate").GetDecimal());
+        Equal(expression == SpeechExpression.Auto, parameters.TryGetProperty("instruction", out var direction));
+        if (expression == SpeechExpression.Auto) True(direction.GetString()!.Contains("英语"));
         Equal(voice, parameters.GetProperty("voice").GetString());
         Equal(lang, parameters.GetProperty("language_hints")[0].GetString());
         socket.Event("task-started", "another-task");
@@ -813,11 +1203,32 @@ static Task SubtitleTiming()
     timer.Replace(new("新原文", [new("EN-US", "New subtitle") ]));
     timer.MarkShown(TimeSpan.FromSeconds(2), 3);
     Equal("New subtitle", timer.TextAt(TimeSpan.FromSeconds(3), settings));
-    timer.Replace(new("空译文", []));
     Equal("新原文\nNew subtitle", timer.TextAt(TimeSpan.FromSeconds(4.99), settings with { ShowOriginal = true }));
+    timer.Replace(new("空译文", []));
+    Equal<string?>(null, timer.TextAt(TimeSpan.FromSeconds(4.99), settings));
     Equal<string?>(null, timer.TextAt(TimeSpan.FromSeconds(5), settings));
     timer.Replace(Chatbox.Example);
     True(timer.TextAt(TimeSpan.FromSeconds(8), settings) is not null);
+    return Task.CompletedTask;
+}
+
+static Task SubtitleRetryTiming()
+{
+    var subtitles = new SubtitlePresentation();
+    var settings = new SubtitleSettings();
+    subtitles.Replace(Chatbox.Example, TimeSpan.FromSeconds(3));
+    subtitles.ReplaceIncoming("等待中", TimeSpan.Zero, 3, 1);
+    True(subtitles.TextAt(TimeSpan.Zero, settings)!.StartsWith("Want"));
+    subtitles.ReplaceIncoming("最新", TimeSpan.FromSeconds(2), 3, 2);
+    // The failed outgoing submission was never marked shown. Its expiry releases incoming priority.
+    Equal("对方：最新", subtitles.TextAt(TimeSpan.FromSeconds(3), settings));
+    Equal<long?>(2, subtitles.MarkShown(TimeSpan.FromSeconds(3), 3));
+    Equal<string?>(null, subtitles.TextAt(TimeSpan.FromSeconds(5), settings));
+    subtitles.Replace(Chatbox.Example, TimeSpan.FromSeconds(9));
+    True(subtitles.TextAt(TimeSpan.FromSeconds(8), settings) is not null);
+    subtitles.MarkShown(TimeSpan.FromSeconds(8), 3);
+    True(subtitles.TextAt(TimeSpan.FromSeconds(10), settings) is not null);
+    Equal<string?>(null, subtitles.TextAt(TimeSpan.FromSeconds(11), settings));
     return Task.CompletedTask;
 }
 
@@ -828,12 +1239,18 @@ static Task IncomingSubtitleTiming()
     subtitles.Replace(new("自己的原文", [new("EN-US", "My subtitle")]));
     Equal("自己的原文\nMy subtitle", subtitles.TextAt(TimeSpan.Zero, settings));
     Equal<long?>(null, subtitles.MarkShown(TimeSpan.Zero, 3));
-    subtitles.ReplaceIncoming("第一句", TimeSpan.FromSeconds(1), 3, 20);
-    subtitles.ReplaceIncoming("最新一句", TimeSpan.FromSeconds(2), 3, 21);
+    subtitles.ReplaceIncoming("较早的一句", TimeSpan.FromSeconds(2), 3, 22);
+    string longSentence = string.Concat(Enumerable.Repeat("这是一句很长的来话字幕，", 20)) + "\r\n结尾也要保留。";
+    subtitles.ReplaceIncoming(longSentence, TimeSpan.FromSeconds(2.5), 3, 23);
     Equal("自己的原文\nMy subtitle", subtitles.TextAt(TimeSpan.FromSeconds(2.9), settings));
-    Equal("来话 · 最新一句", subtitles.TextAt(TimeSpan.FromSeconds(3), settings));
-    Equal<long?>(21, subtitles.MarkShown(TimeSpan.FromSeconds(3), 3));
-    Equal<long?>(null, subtitles.MarkShown(TimeSpan.FromSeconds(4), 3));
+    Equal("对方：" + longSentence.ReplaceLineEndings("\n"), subtitles.TextAt(TimeSpan.FromSeconds(3), settings));
+    Equal<long?>(23, subtitles.MarkShown(TimeSpan.FromSeconds(3), 3));
+    Equal<long?>(null, subtitles.MarkShown(TimeSpan.FromSeconds(3.1), 3));
+    subtitles.ReplaceIncoming("又来了一句", TimeSpan.FromSeconds(3.5), 1.5, 24);
+    Equal("对方：又来了一句", subtitles.TextAt(TimeSpan.FromSeconds(3.5), settings));
+    Equal<long?>(24, subtitles.MarkShown(TimeSpan.FromSeconds(3.5), 1.5));
+    subtitles.ReplaceIncoming(" \r\n ", TimeSpan.FromSeconds(4), 2, 25);
+    Equal("对方：又来了一句", subtitles.TextAt(TimeSpan.FromSeconds(4.1), settings));
     Equal<string?>(null, subtitles.TextAt(TimeSpan.FromSeconds(5), settings));
 
     subtitles.Replace(new("原文", [new("EN-US", "Longer subtitle")]));
@@ -843,6 +1260,52 @@ static Task IncomingSubtitleTiming()
     subtitles.ReplaceIncoming("被清除", TimeSpan.FromSeconds(10), 3, 23);
     subtitles.ClearIncoming();
     Equal<string?>(null, subtitles.TextAt(TimeSpan.FromSeconds(11), settings));
+    return Task.CompletedTask;
+}
+
+static Task HotwordImport()
+{
+    var vocabulary = RecognitionVocabulary.ParseLines(["  桔梗  ", "", "The Black Cat\t2", "the black cat\t3"]);
+    Equal(2, vocabulary.Count);
+    Equal(4, vocabulary["桔梗"]);
+    Equal(3, vocabulary["The Black Cat"]);
+    Equal(1, RecognitionVocabulary.ParseLines([new string('地', 15)]).Count);
+    Equal(1, RecognitionVocabulary.ParseLines(["one two three four five six seven"]).Count);
+    _ = Throws<FormatException>(() => RecognitionVocabulary.ParseLines([new string('地', 16)]));
+    _ = Throws<FormatException>(() => RecognitionVocabulary.ParseLines(["one two three four five six seven eight"]));
+    _ = Throws<FormatException>(() => RecognitionVocabulary.ParseLines(["模型\t0"]));
+    _ = Throws<FormatException>(() => RecognitionVocabulary.ParseLines(["模型\t6"]));
+    _ = Throws<FormatException>(() => RecognitionVocabulary.ParseLines(["模型\t"]));
+    _ = Throws<FormatException>(() => RecognitionVocabulary.ParseLines(["模型\t4\t3"]));
+    Equal(50, RecognitionVocabulary.ParseLines(["Kipfel\t50"])["Kipfel"]);
+    var strongTerms = Enumerable.Range(0, RecognitionVocabulary.MaxStrongTerms).Select(i => $"Avatar {i}\t50").ToArray();
+    Equal(RecognitionVocabulary.MaxStrongTerms, RecognitionVocabulary.ParseLines(strongTerms.Append("avatar 0\t50")).Count);
+    _ = Throws<FormatException>(() => RecognitionVocabulary.ParseLines(strongTerms.Append("Kipfel\t50")));
+    _ = Throws<FormatException>(() => RecognitionVocabulary.ParseLines(Enumerable.Range(0, RecognitionVocabulary.MaxTerms + 1)
+        .Select(i => $"VRChat {i}")));
+    return Task.CompletedTask;
+}
+
+static Task WindowLayoutPersistence()
+{
+    var directory = Directory.CreateTempSubdirectory("vrc-window-");
+    var store = new SettingsStore(Path.Combine(directory.FullName, "config.json"));
+    try
+    {
+        File.WriteAllText(store.Path, """{"oscPort":9015,"future":{"example":1}}""");
+        Equal<WindowLayout?>(null, store.Load().Window);
+        var layout = new WindowLayout(991, 651, true);
+        store.SaveWindow(layout);
+        Equal(layout, store.Load().Window);
+        Equal(9015, store.Load().OscPort);
+        using var saved = JsonDocument.Parse(File.ReadAllText(store.Path));
+        Equal(1, saved.RootElement.GetProperty("future").GetProperty("example").GetInt32());
+        const string invalid = """{"oscPort":-2}""";
+        File.WriteAllText(store.Path, invalid);
+        _ = Throws<FormatException>(() => store.SaveWindow(layout));
+        Equal(invalid, File.ReadAllText(store.Path));
+    }
+    finally { File.Delete(store.Path); directory.Delete(); }
     return Task.CompletedTask;
 }
 
@@ -873,14 +1336,29 @@ static Task ConfigRoundTrip()
         Equal("EN-US,JA", string.Join(',', settings.TargetLanguages));
         File.WriteAllText(store.Path, """{"oscPort":9010,"subtitles":{"distanceMeters":2.0}}""");
         settings = new SettingsStore(store.Path).Load();
+        Equal(1m, settings.Speech.Rate);
+        Equal(SpeechExpression.Auto, settings.Speech.Expression);
+        True(settings.Speech.Keywords.SequenceEqual(SpeechExpression.Defaults));
         Equal(9010, settings.OscPort);
         Equal(3d, settings.Subtitles.DurationSeconds);
         Equal(2d, settings.Subtitles.DistanceMeters);
         Equal(AppearanceMode.System, settings.Appearance);
+        True(settings.RecognitionHotwordsEnabled);
+        Equal(0, settings.RecognitionHotwords.Count);
+    Equal("", settings.Terminology.Context);
+    Equal(0, settings.Terminology.Corrections.Count);
+    Equal(0, settings.Terminology.Terms.Count);
+        Equal(300, settings.IncomingSentenceSilenceMs);
+        _ = Throws<FormatException>(() => (settings with { IncomingSentenceSilenceMs = 199 }).Validate());
+        _ = Throws<FormatException>(() => (settings with { IncomingSentenceSilenceMs = 6001 }).Validate());
         store.Save(settings with { Appearance = AppearanceMode.Dark, BailianApiKey = "one", DeepLApiKey = "two:fx", TargetLanguages = ["ja", "en-us"],
-            IncomingPlaybackDeviceId = "example-render-endpoint", IncomingStrongerNoiseFilter = true,
+            IncomingPlaybackDeviceId = "example-render-endpoint", IncomingStrongerNoiseFilter = true, IncomingSentenceSilenceMs = 225,
+            RecognitionHotwordsEnabled = false, RecognitionHotwords = RecognitionVocabulary.ParseLines(["模型\t5", "Kipfel\t50"]),
+            Terminology = new("VRChat 术语", [new("全锥", "全追")], [new("全追", "en-us", "full-body tracking")]),
             Speech = new() { Enabled = true, Mode = SpeechMode.JapaneseTranslation, VolumePercent = 35,
+                Expression = "whispers", Keywords = [], Rate = 1.25m,
                 ChineseVoice = "  zh-voice  ", EnglishVoice = "en-voice", JapaneseVoice = "ja-voice", OutputDeviceId = "tts-output",
+                VoiceAliases = new Dictionary<string, string> { ["zh-voice"] = "本机音色", ["Emily_v3.1"] = "英式播报" },
                 MonitorEnabled = true, MonitorDeviceId = "headphones" } });
         string raw = File.ReadAllText(store.Path);
         True(raw.Contains("\"one\"") && raw.Contains("\"two:fx\""));
@@ -890,10 +1368,30 @@ static Task ConfigRoundTrip()
         Equal(AppearanceMode.Light, store.Load().Appearance);
         Equal("JA,EN-US", string.Join(',', store.Load().TargetLanguages));
         Equal("example-render-endpoint", store.Load().IncomingPlaybackDeviceId);
+        True(!store.Load().RecognitionHotwordsEnabled);
+        Equal(5, store.Load().RecognitionHotwords["模型"]);
+        Equal(50, store.Load().RecognitionHotwords["Kipfel"]);
+        var terminology = store.Load().Terminology;
+        Equal("VRChat 术语", terminology.Context);
+        Equal("你用的是什么全追？", terminology.Correct("你用的是什么全锥？", out int corrections));
+        Equal(1, corrections);
+        Equal("full-body tracking", terminology.MatchTerms("全追", "EN-US").Single().Target);
         True(store.Load().IncomingStrongerNoiseFilter);
+        Equal(225, store.Load().IncomingSentenceSilenceMs);
+        var loadedSpeech = store.Load().Speech;
+        Equal(0, loadedSpeech.Keywords.Count);
         Equal(new SpeechSettings { Enabled = true, Mode = SpeechMode.JapaneseTranslation, VolumePercent = 35,
+            Expression = "whispers", Rate = 1.25m, Keywords = loadedSpeech.Keywords,
             ChineseVoice = "zh-voice", EnglishVoice = "en-voice", JapaneseVoice = "ja-voice", OutputDeviceId = "tts-output",
-            MonitorEnabled = true, MonitorDeviceId = "headphones" }, store.Load().Speech);
+            MonitorEnabled = true, MonitorDeviceId = "headphones", Voices = loadedSpeech.Voices }, loadedSpeech);
+        var loadedVoices = loadedSpeech.Voices!;
+        Equal("本机音色", loadedVoices.Single(voice => voice.Id == "zh-voice").Alias);
+        Equal("英式播报", loadedVoices.Single(voice => voice.Id == "Emily_v3.1").Alias);
+        Equal(SpeechVoiceLanguages.English, loadedVoices.Single(voice => voice.Id == "Emily_v3.1").Languages);
+        True(loadedVoices.Any(voice => voice.Id == "en-voice"));
+        True(!raw.Contains("\"voiceAliases\""));
+        store.Save(store.Load() with { Speech = loadedSpeech with { Keywords = [new(" 握手 ", "giggles")] } });
+        Equal(new SpeechKeyword("握手", "giggles"), store.Load().Speech.Keywords.Single());
         Equal(1, Directory.GetFiles(directory).Length);
         const string bad = "{\"oscPort\":";
         File.WriteAllText(store.Path, bad);

@@ -246,11 +246,17 @@ internal sealed class SteamVr(Action<string> log) : IDisposable
     public void Show(string text, SubtitleSettings settings)
     {
         if (system is null) throw new ServiceException("请先连接 SteamVR 再显示头显字幕。");
-        overlay ??= new SubtitleOverlay(OpenVR.Overlay ?? throw new ServiceException("SteamVR Overlay 接口不可用。"), AppKey);
+        overlay ??= new SubtitleOverlay(system, OpenVR.Overlay ?? throw new ServiceException("SteamVR Overlay 接口不可用。"), AppKey);
         overlay.Show(text, settings);
     }
 
     public void Hide() => overlay?.Hide();
+
+    public void ResetOverlay()
+    {
+        overlay?.Destroy(disconnecting: false);
+        overlay = null;
+    }
 
     private void Disconnect(TimeSpan now)
     {

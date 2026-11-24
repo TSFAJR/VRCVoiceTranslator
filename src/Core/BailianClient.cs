@@ -18,15 +18,24 @@ public sealed class BailianClient
     private const int FrameBytes = 3200;
     private readonly Func<Settings, CancellationToken, Task<WebSocket>> connect;
     private readonly TimeSpan startupTimeout;
+    private readonly Action<string>? log;
 
-    public BailianClient(Func<Settings, CancellationToken, Task<WebSocket>>? connect = null, TimeSpan? startupTimeout = null)
+    public BailianClient(Func<Settings, CancellationToken, Task<WebSocket>>? connect = null, TimeSpan? startupTimeout = null,
+        Action<string>? log = null)
     {
         this.connect = connect ?? ConnectAsync;
         this.startupTimeout = startupTimeout ?? TimeSpan.FromSeconds(8);
+        this.log = log;
     }
 
-    public Task<string> RecognizeAsync(Settings settings, IAsyncEnumerable<byte[]> audio, CancellationToken cancellation) =>
-        RecognizeCoreAsync(settings, audio, onSentence: null, onStarted: null, cancellation);
+    public async Task<string> RecognizeAsync(Settings settings, IAsyncEnumerable<byte[]> audio, CancellationToken cancellation,
+        Action<int>? onCorrectionCount = null)
+    {
+        string original = await RecognizeCoreAsync(settings, audio, onSentence: null, onStarted: null, cancellation).ConfigureAwait(false);
+        string corrected = settings.Terminology.Correct(original, out int count);
+        onCorrectionCount?.Invoke(count);
+        return corrected;
+    }
 
     public async Task StreamSentencesAsync(Settings settings, IAsyncEnumerable<byte[]> audio,
         Action<RecognizedSentence> onSentence, CancellationToken cancellation, Action? onStarted = null) =>
@@ -46,14 +55,23 @@ public sealed class BailianClient
         Task<string>? receiver = null;
         Task? sender = null;
         string id = Guid.NewGuid().ToString();
+        var hotwords = settings.RecognitionHotwordsEnabled ? settings.RecognitionHotwords : null;
+        bool incoming = onSentence is not null;
         try
         {
             socket = await connect(settings, startup.Token).ConfigureAwait(false);
-            await SendJsonAsync(socket, "run-task", id, RunPayload(settings, incoming: onSentence is not null), startup.Token).ConfigureAwait(false);
+            await SendJsonAsync(socket, "run-task", id, RunPayload(settings, incoming, hotwords), startup.Token).ConfigureAwait(false);
             receiver = ReceiveResultsAsync(socket, id, ready, finishing.Task, onSentence, lifetime.Token);
             var startedOrEnded = await Task.WhenAny(ready.Task, receiver).WaitAsync(startup.Token).ConfigureAwait(false);
             if (startedOrEnded == receiver) return await receiver.ConfigureAwait(false);
             startup.CancelAfter(Timeout.InfiniteTimeSpan);
+            if (log is not null)
+            {
+                int strong = hotwords?.Values.Count(weight => weight == RecognitionVocabulary.StrongWeight) ?? 0;
+                string source = incoming ? "来话" : "麦克风";
+                string context = settings.Terminology.Context.Length > 0 ? "已附带" : "无";
+                log($"{source}识别任务已启动 · 请求附带热词 {hotwords?.Count ?? 0} 条（加强 {strong} 条），上下文{context}。");
+            }
             onStarted?.Invoke();
 
             sender = SendAudioAsync(socket, id, audio, finishing, lifetime.Token);
@@ -116,7 +134,7 @@ public sealed class BailianClient
         catch { socket.Dispose(); throw; }
     }
 
-    private static object RunPayload(Settings settings, bool incoming)
+    private static object RunPayload(Settings settings, bool incoming, IReadOnlyDictionary<string, int>? hotwords)
     {
         var parameters = new Dictionary<string, object>
         {
@@ -125,7 +143,7 @@ public sealed class BailianClient
         };
         if (incoming)
         {
-            parameters["max_sentence_silence"] = 500;
+            parameters["max_sentence_silence"] = settings.IncomingSentenceSilenceMs;
             if (settings.IncomingStrongerNoiseFilter) parameters["speech_noise_threshold"] = 0.1;
         }
         string? hint = settings.SourceLanguage switch
@@ -134,7 +152,13 @@ public sealed class BailianClient
             SourceLanguage.Japanese => "ja", SourceLanguage.Korean => "ko", _ => null
         };
         if (hint is not null) parameters["language_hints"] = new[] { hint };
-        return new { task_group = "audio", task = "asr", function = "recognition", model = Model, parameters, input = new { } };
+        if (hotwords is { Count: > 0 }) parameters["vocabulary"] = hotwords;
+        string context = settings.Terminology.Context;
+        object input = context.Length == 0 ? new { } : new
+        {
+            context = new[] { new { role = "user", content = new[] { new { type = "input_text", text = context } } } }
+        };
+        return new { task_group = "audio", task = "asr", function = "recognition", model = Model, parameters, input };
     }
 
     internal static Task SendJsonAsync(WebSocket socket, string action, string id, object payload, CancellationToken cancellation)

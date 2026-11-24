@@ -2,48 +2,51 @@ namespace VrcTranslator;
 
 public sealed class SubtitlePresentation
 {
+    private IncomingCaption? incoming;
     private string? translations;
     private string? original;
     private string? combined;
     private TimeSpan? shownUntil;
-    private string? incoming;
-    private TimeSpan incomingUntil;
-    private long? incomingRecognizedAt;
+    private TimeSpan? firstShowDeadline;
 
-    public void Replace(VoiceResult result)
+    public void Replace(VoiceResult result, TimeSpan? firstShowDeadline = null)
     {
-        if (result.Translations.Count == 0) return;
+        if (result.Translations.Count == 0) { ClearOutgoing(); return; }
         translations = Text(result, showOriginal: false);
         original = result.Original;
         combined = null;
         shownUntil = null;
+        this.firstShowDeadline = firstShowDeadline;
     }
 
     public void ReplaceIncoming(string text, TimeSpan readyAt, double seconds, long recognizedAt)
     {
-        incoming = "来话 · " + text;
-        incomingUntil = readyAt + TimeSpan.FromSeconds(seconds);
-        incomingRecognizedAt = recognizedAt;
+        text = text.Trim().ReplaceLineEndings("\n");
+        if (text.Length == 0) return;
+
+        incoming = new("对方：" + text, readyAt + TimeSpan.FromSeconds(seconds), recognizedAt);
     }
 
     public long? MarkShown(TimeSpan now, double seconds)
     {
         if (translations is not null)
         {
+            firstShowDeadline = null;
             shownUntil ??= now + TimeSpan.FromSeconds(seconds);
             return null;
         }
-        long? firstDisplay = incomingRecognizedAt;
-        incomingRecognizedAt = null;
-        return firstDisplay;
+
+        if (incoming is not { RecognizedAt: long recognizedAt } caption || now >= caption.ExpiresAt) return null;
+        incoming = caption with { RecognizedAt = null };
+        return recognizedAt;
     }
 
     public string? TextAt(TimeSpan now, SubtitleSettings settings)
     {
         if (!settings.Enabled) { Clear(); return null; }
-        if (now >= shownUntil) ClearOutgoing();
-        if (now >= incomingUntil) ClearIncoming();
-        if (translations is null) return incoming;
+        if (now >= shownUntil || now >= firstShowDeadline) ClearOutgoing();
+        if (now >= incoming?.ExpiresAt) ClearIncoming();
+        if (translations is null) return incoming?.Text;
         if (!settings.ShowOriginal) return translations;
         return combined ??= original + "\n" + translations;
     }
@@ -54,18 +57,17 @@ public sealed class SubtitlePresentation
         ClearIncoming();
     }
 
-    public void ClearIncoming()
-    {
-        incoming = null;
-        incomingRecognizedAt = null;
-    }
+    public void ClearIncoming() => incoming = null;
 
-    private void ClearOutgoing()
+    private readonly record struct IncomingCaption(string Text, TimeSpan ExpiresAt, long? RecognizedAt);
+
+    public void ClearOutgoing()
     {
         translations = null;
         original = null;
         combined = null;
         shownUntil = null;
+        firstShowDeadline = null;
     }
 
     public static string Text(VoiceResult result, bool showOriginal)

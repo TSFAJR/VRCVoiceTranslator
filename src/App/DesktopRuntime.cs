@@ -26,7 +26,7 @@ internal sealed partial class DesktopRuntime : IDisposable
     private readonly ConcurrentQueue<Action> controls = new();
     private readonly TriggerGate gate = new();
     private readonly SubtitlePresentation subtitles = new();
-    private readonly BailianClient asr = new();
+    private readonly BailianClient asr;
     private readonly BailianTtsClient tts = new();
     private readonly HttpClient http = new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = Timeout.InfiniteTimeSpan };
     private readonly TranslationClient translate;
@@ -39,6 +39,8 @@ internal sealed partial class DesktopRuntime : IDisposable
     private bool keyboardPaused;
     private bool wasPreviewing;
     private string? lastOverlayError;
+    private int overlayRetryMs;
+    private TimeSpan nextOverlayAttempt;
     private RecordingSession? active;
     private SpeechPlayback? playback;
     private long speechGeneration;
@@ -53,6 +55,7 @@ internal sealed partial class DesktopRuntime : IDisposable
     {
         this.log = log;
         settings = initial;
+        asr = new(log: log.Write);
         translate = new(http);
         vr = new(log.Write);
         worker = new Thread(Run) { IsBackground = true, Name = "VRC SteamVR/Input" };
@@ -77,7 +80,7 @@ internal sealed partial class DesktopRuntime : IDisposable
     {
         if (gate.Capturing) { SetSpeechStatus("请在本次录音结束后试听", false); return; }
         InterruptSpeech();
-        StartSpeech(options.SelectMode().SampleText, Current with { Speech = options }, Stopwatch.GetTimestamp());
+        StartSpeech(options.PreviewSpeech(), Current with { Speech = options }, Stopwatch.GetTimestamp(), "试听");
     });
     public void SetIncoming(bool enabled, string? playbackDeviceId, bool strongerNoiseFilter) => controls.Enqueue(() =>
     {
@@ -93,6 +96,7 @@ internal sealed partial class DesktopRuntime : IDisposable
         if (original.Length == 0) return false;
         var cancellation = exiting.Token;
         var snapshot = Current;
+        long started = Stopwatch.GetTimestamp();
         TranslationBatch batch;
         try
         {
@@ -107,6 +111,7 @@ internal sealed partial class DesktopRuntime : IDisposable
             batch = new([], [$"翻译请求失败（{error.GetType().Name}）。"]);
         }
         cancellation.ThrowIfCancellationRequested();
+        double elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
 
         var result = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
         controls.Enqueue(() =>
@@ -119,7 +124,12 @@ internal sealed partial class DesktopRuntime : IDisposable
             if (batch.Errors.Count > 0)
                 ReportError(new ServiceException(string.Join("  ", batch.Errors)), "文字翻译");
             ShowTranslationNotices(batch.Notices);
-            result.SetResult(SendChatbox(() => Chatbox.FormatManual(original, batch.Results), port));
+            var outgoing = new VoiceResult(original, batch.Results);
+            bool sent = SendChatbox(() => Chatbox.FormatManual(original, batch.Results), port);
+            PresentOutgoing(outgoing, Current.Subtitles);
+            result.SetResult(sent);
+            if (batch.RequestedTermCount > 0)
+                log.Write($"手动文字至译文：{elapsed:F0} 毫秒，术语 {batch.RequestedTermCount} 条");
         });
         return await result.Task.WaitAsync(cancellation).ConfigureAwait(false);
     }
@@ -218,6 +228,7 @@ internal sealed partial class DesktopRuntime : IDisposable
             case TriggerCommand.Start:
                 StopTest();
                 InterruptSpeech();
+                subtitles.ClearOutgoing();
                 long generation = speechGeneration;
                 SetStatus(s => s with { Error = "", TranslationNotice = "" });
                 active = new RecordingSession(inputSettings, asr, translate, log.Write,
@@ -250,7 +261,7 @@ internal sealed partial class DesktopRuntime : IDisposable
         controls.Enqueue(() =>
         {
             if (generation != speechGeneration || !Current.Speech.Enabled) return;
-            if (selection.Text is { } text) StartSpeech(text, snapshot, readyAt);
+            if (selection.Text is not null) StartSpeech(selection, snapshot, readyAt, "正式播报");
             else if (selection.SkipReason is { } reason)
             {
                 SetSpeechStatus(reason, false);
@@ -259,9 +270,10 @@ internal sealed partial class DesktopRuntime : IDisposable
         });
     }
 
-    private void StartSpeech(string text, Settings snapshot, long readyAt)
+    private void StartSpeech(SpeechSelection selection, Settings snapshot, long readyAt, string source)
     {
-        playback = new SpeechPlayback(tts, text, snapshot, readyAt, log.Write);
+        log.Write($"{source} · {snapshot.Speech.SelectMode().Language} · 语气 {selection.Tag?.Label ?? "原声"} · {snapshot.Speech.Rate:0.00}×");
+        playback = new SpeechPlayback(tts, selection, snapshot, readyAt, log.Write);
         SetSpeechStatus("正在合成", true);
     }
 
@@ -378,8 +390,7 @@ internal sealed partial class DesktopRuntime : IDisposable
         string detail = listener.Status;
         if (!connected) detail += " · SteamVR 未连接";
         SetIncomingStatus(true, detail);
-        var translation = listener.TakeLatest();
-        if (connected && translation is not null)
+        if (listener.TakeNext() is { } translation && connected)
             subtitles.ReplaceIncoming(translation.Text, clock.Elapsed - Stopwatch.GetElapsedTime(translation.ReadyAt),
                 current.DurationSeconds, translation.RecognizedAt);
     }
@@ -418,14 +429,18 @@ internal sealed partial class DesktopRuntime : IDisposable
                 return;
             }
             if (current.ChatboxEnabled) SendChatbox(() => Chatbox.Format(result), current.OscPort);
-            if (current.Subtitles.Enabled && result.Translations.Count > 0 && Volatile.Read(ref preview) is null)
-            {
-                if (vr.Connected) subtitles.Replace(result);
-                else ReportError(new ServiceException("SteamVR 未连接，无法显示本次字幕。"), "VR 字幕");
-            }
+            PresentOutgoing(result, current.Subtitles);
         }
         catch (OperationCanceledException) { log.Write("录音已取消。"); }
         catch (Exception error) { ReportError(error, "语音处理"); }
+    }
+
+    private void PresentOutgoing(VoiceResult result, SubtitleSettings options)
+    {
+        if (!options.Enabled || Volatile.Read(ref preview) is not null) return;
+        if (vr.Connected) subtitles.Replace(result, clock.Elapsed + TimeSpan.FromSeconds(options.DurationSeconds));
+        else if (result.Translations.Count > 0)
+            ReportError(new ServiceException("SteamVR 未连接，无法显示本次字幕。"), "VR 字幕");
     }
 
     private void ShowTranslationNotices(IReadOnlyList<string> notices)
@@ -464,6 +479,7 @@ internal sealed partial class DesktopRuntime : IDisposable
         }
         if (!connected)
         {
+            overlayRetryMs = 0;
             if (draft is not null && lastOverlayError != "请先连接 SteamVR 再预览字幕。")
             {
                 lastOverlayError = "请先连接 SteamVR 再预览字幕。";
@@ -472,23 +488,30 @@ internal sealed partial class DesktopRuntime : IDisposable
             else if (draft is null) lastOverlayError = null;
             return;
         }
+        var now = clock.Elapsed;
+        if (overlayRetryMs > 0 && now < nextOverlayAttempt) return;
         try
         {
-            if (draft is not null) vr.Show(draft.ShowOriginal ? PreviewWithOriginal : PreviewTranslations, draft);
-            else if (subtitles.TextAt(clock.Elapsed, current) is { } text)
+            if (overlayRetryMs > 0) vr.ResetOverlay();
+            string? text = draft is null ? subtitles.TextAt(clock.Elapsed, current)
+                : draft.ShowOriginal ? PreviewWithOriginal : PreviewTranslations;
+            if (text is not null)
             {
-                vr.Show(text, current);
-                if (subtitles.MarkShown(clock.Elapsed, current.DurationSeconds) is long recognizedAt)
+                vr.Show(text, draft ?? current);
+                if (draft is null && subtitles.MarkShown(clock.Elapsed, current.DurationSeconds) is long recognizedAt)
                     log.Write($"来话识别至字幕：{Stopwatch.GetElapsedTime(recognizedAt).TotalMilliseconds:F0} 毫秒");
+                if (lastOverlayError is not null) log.Write("SteamVR 字幕已恢复显示。");
+                lastOverlayError = null;
             }
             else vr.Hide();
-            lastOverlayError = null;
+            overlayRetryMs = 0;
         }
         catch (Exception error)
         {
             if (lastOverlayError != error.Message) ReportError(error, "VR 字幕");
             lastOverlayError = error.Message;
-            subtitles.Clear();
+            overlayRetryMs = overlayRetryMs == 0 ? 250 : Math.Min(overlayRetryMs * 2, 2000);
+            nextOverlayAttempt = clock.Elapsed + TimeSpan.FromMilliseconds(overlayRetryMs);
         }
     }
 

@@ -6,6 +6,8 @@ namespace VrcTranslator.Desktop;
 
 internal sealed class SettingsWindow : Form
 {
+    private const int IncomingCardTop = 302;
+    private static int IncomingCardHeight => IncomingLoopbackCapture.UsesProcessLoopback ? 114 : 153;
     private readonly SettingsStore store;
     private readonly DesktopRuntime runtime;
     private readonly ActivityLog log;
@@ -46,9 +48,16 @@ internal sealed class SettingsWindow : Form
     private readonly TextFrame deepLPassword;
     private readonly ComboBox translationProvider = DropDown("翻译服务", "DeepL", "qwen-mt-flash", "qwen-mt-lite");
     private readonly ComboBox source = DropDown("语音语言", "中文", "英语", "日语", "韩语", "自动");
+    private readonly SettingsButton hotwordButton = MakeButton("热词词库");
+    private RecognitionVocabularyDialog? hotwordEditor;
+    private IReadOnlyDictionary<string, int> recognitionHotwords = new Dictionary<string, int>();
+    private bool recognitionHotwordsEnabled;
+    private TerminologySettings terminology = TerminologySettings.Empty;
     private readonly LanguageOrder targets = new();
     private readonly SettingsSwitch incomingToggle = new("来话翻译") { AutoCheck = false };
     private readonly SettingsSwitch incomingNoiseFilter = new("加强来话底噪过滤");
+    private readonly NumericUpDown incomingSentenceSilence = Number("来话断句间隔",
+        Settings.MinIncomingSentenceSilenceMs, Settings.MaxIncomingSentenceSilenceMs, increment: 50, unit: " 毫秒");
     private readonly Label incomingState = Caption("已关闭", LabelTone.Muted);
     private readonly ComboBox playback = DropDown("来话播放设备");
     private readonly SettingsButton refreshPlayback = MakeButton("", SettingsButtonStyle.Neutral, SettingsGlyph.Refresh);
@@ -75,10 +84,16 @@ internal sealed class SettingsWindow : Form
     private readonly HeadsetPreview headsetPreview = new();
     private readonly SettingsSwitch speechEnabled = new("启用自动播报");
     private readonly ComboBox speechMode = DropDown("播报模式", "中文原文", "英文译文", "日文译文");
-    private readonly TextBox voiceChinese = Entry("中文音色 ID");
-    private readonly TextBox voiceEnglish = Entry("英文音色 ID");
-    private readonly TextBox voiceJapanese = Entry("日文音色 ID");
+    private readonly ComboBox voiceChinese = DropDown("中文音色");
+    private readonly ComboBox voiceEnglish = DropDown("英文音色");
+    private readonly ComboBox voiceJapanese = DropDown("日文音色");
+    private IReadOnlyList<SpeechVoiceChoice> voiceLibrary = [];
+    private SpeechVoiceManager? voiceManager;
     private readonly NumericUpDown speechVolume = Number("播报音量", 0, 100, unit: "%");
+    private readonly ComboBox speechExpression = DropDown("播报语气", "自动匹配关键词", "原声");
+    private readonly NumericUpDown speechRate = Number("播报语速", 0.50m, 2m, 2, 0.05m, "×");
+    private IReadOnlyList<SpeechKeyword> speechKeywords = SpeechExpression.Defaults;
+    private SpeechKeywordDialog? keywordEditor;
     private readonly ComboBox speechOutput = DropDown("播报输出设备");
     private readonly SettingsSwitch speechMonitor = new("监听播报");
     private readonly ComboBox speechMonitorDevice = DropDown("播报监听设备");
@@ -94,6 +109,8 @@ internal sealed class SettingsWindow : Form
     private bool previewing;
     private bool advancedExpanded;
     private bool allowClose;
+    private WindowLayout? currentLayout;
+    private WindowLayout? savedLayout;
     private string lastVrInfo = "";
     private DateTime savedUntil;
 
@@ -112,7 +129,6 @@ internal sealed class SettingsWindow : Form
         AutoScaleDimensions = new SizeF(96, 96);
         AutoScaleMode = AutoScaleMode.Dpi;
         StartPosition = FormStartPosition.CenterScreen;
-        ClientSize = new Size(984, 552);
 
         bailianPassword = new(bailianKey, password: true);
         deepLPassword = new(deepLKey, password: true);
@@ -126,6 +142,9 @@ internal sealed class SettingsWindow : Form
         ApplyShellMetrics();
 
         LoadValues(runtime.Current);
+        speechExpression.SelectedIndexChanged += (_, _) => ApplySpeechStyle();
+        speechRate.ValueChanged += (_, _) => ApplySpeechStyle();
+        bailianRegion.SelectedIndexChanged += (_, _) => ReloadVoiceChoices();
         appearance.SelectedModeChanged += (_, _) => UpdateAppearance();
         SelectPage(0);
         refresh.Tick += (_, _) => ReadStatus();
@@ -209,6 +228,64 @@ internal sealed class SettingsWindow : Form
         ApplyShellMetrics();
     }
 
+    protected override void OnLoad(EventArgs e)
+    {
+        base.OnLoad(e);
+        ApplyShellMetrics();
+        var area = Screen.FromControl(this).WorkingArea;
+        var saved = runtime.Current.Window;
+        var border = SizeFromClientSize(Size.Empty);
+        int availableWidth = Math.Max(1, area.Width - border.Width);
+        int availableHeight = Math.Max(1, area.Height - border.Height);
+        int Restore(int logical, int available) =>
+            (int)Math.Min(available, Math.Round(logical * (DeviceDpi / 96d)));
+
+        int defaultHeight = heading.Height + pages.Max(page => page.Height) + footer.Height + ScalePixels(8);
+        ClientSize = new Size(saved is { Width: > 0 } ? Restore(saved.Width, availableWidth) : Math.Min(ScalePixels(984), availableWidth),
+            saved is { Height: > 0 } ? Restore(saved.Height, availableHeight) : Math.Min(defaultHeight, availableHeight));
+        Location = new Point(area.Left + (area.Width - Width) / 2, area.Top + (area.Height - Height) / 2);
+        currentLayout = NormalLayout();
+        if (saved?.Maximized == true) WindowState = FormWindowState.Maximized;
+        savedLayout = currentLayout;
+    }
+
+    private WindowLayout NormalLayout() => new(
+        (int)Math.Round(ClientSize.Width * 96d / DeviceDpi), (int)Math.Round(ClientSize.Height * 96d / DeviceDpi));
+
+    protected override void OnResize(EventArgs e)
+    {
+        base.OnResize(e);
+        if (currentLayout is null) return;
+        if (WindowState == FormWindowState.Normal) currentLayout = NormalLayout();
+        else if (WindowState == FormWindowState.Maximized) currentLayout = currentLayout with { Maximized = true };
+    }
+
+    public void RestoreFromMinimized()
+    {
+        if (WindowState == FormWindowState.Minimized)
+            WindowState = currentLayout?.Maximized == true ? FormWindowState.Maximized : FormWindowState.Normal;
+    }
+
+    protected override void OnResizeEnd(EventArgs e)
+    {
+        base.OnResizeEnd(e);
+        SaveWindowLayout();
+    }
+
+    private void SaveWindowLayout()
+    {
+        if (currentLayout is null || currentLayout == savedLayout) return;
+        try
+        {
+            store.SaveWindow(currentLayout);
+            savedLayout = currentLayout;
+        }
+        catch (Exception error) when (error is FormatException or System.Text.Json.JsonException or IOException or UnauthorizedAccessException)
+        {
+            log.Write($"窗口大小保存失败（0x{error.HResult:X8}）。");
+        }
+    }
+
     private bool FollowsSystemAppearance => appearance.SelectedMode == AppearanceMode.System;
 
     protected override void WndProc(ref Message message)
@@ -235,6 +312,9 @@ internal sealed class SettingsWindow : Form
         if (IsHandleCreated) UiTheme.ApplyCaption(Handle);
         Invalidate(invalidateChildren: true);
         logWindow?.ApplyTheme();
+        hotwordEditor?.ApplyTheme();
+        voiceManager?.ApplyTheme();
+        keywordEditor?.ApplyTheme();
     }
 
     private void ApplyShellMetrics()
@@ -245,12 +325,15 @@ internal sealed class SettingsWindow : Form
         heading.Height = ScalePixels(62);
         headingActions.Width = ScalePixels(236);
         footer.Height = ScalePixels(58);
-        MinimumSize = SizeFromClientSize(new Size(ScalePixels(878), ScalePixels(404)));
+        var area = Screen.FromRectangle(Bounds).WorkingArea.Size;
+        var minimum = SizeFromClientSize(new Size(ScalePixels(878), ScalePixels(404)));
+        MinimumSize = new Size(Math.Min(area.Width, minimum.Width), Math.Min(area.Height, minimum.Height));
+        viewport.AutoScrollMinSize = new Size(ScalePixels(626), 0);
         pages[0].Height = ScalePixels(advancedExpanded ? 385 : 328);
-        pages[1].Height = ScalePixels(IncomingLoopbackCapture.UsesProcessLoopback ? 382 : 421);
+        pages[1].Height = ScalePixels(IncomingCardTop + IncomingCardHeight);
         pages[2].Height = ScalePixels(360);
         pages[3].Height = ScalePixels(402);
-        pages[4].Height = ScalePixels(379);
+        pages[4].Height = ScalePixels(517);
     }
 
     private static CardPanel AddCard(SettingsPage page, int x, int y, int width, int height) =>
@@ -328,7 +411,7 @@ internal sealed class SettingsWindow : Form
         var page = new SettingsPage();
         var credentials = AddCard(page, 0, 0, 730, 119);
         var translation = AddCard(page, 0, 131, 730, 159);
-        var incoming = AddCard(page, 0, 302, 730, IncomingLoopbackCapture.UsesProcessLoopback ? 80 : 119);
+        var incoming = AddCard(page, 0, IncomingCardTop, 730, IncomingCardHeight);
 
         workspaceId.PlaceholderText = "业务空间 ID";
         credentials.Place(Caption("百炼 Workspace ID"), 16, 11, 147, 29);
@@ -361,6 +444,8 @@ internal sealed class SettingsWindow : Form
             if (LanguageOrder.ChooseLanguage(this, Font) is { } code) targets.AddLanguage(code);
         });
         translation.Place(add, 167, 121, 152, 28);
+        translation.Place(hotwordButton, 536, 121, 178, 28);
+        hotwordButton.Click += (_, _) => EditHotwords();
         void ResizeLanguages()
         {
             int rows = Math.Min(2, targets.Items.Count);
@@ -379,18 +464,22 @@ internal sealed class SettingsWindow : Form
         incoming.Place(incomingNoiseFilter, 662, 11, 52, 29);
         help.SetToolTip(incomingNoiseFilter, "开启来话翻译前调整。加强过滤也可能漏掉轻声说话。");
         incomingToggle.Click += (_, _) => runtime.SetIncoming(!runtime.Status.IncomingActive, SelectedPlayback, incomingNoiseFilter.Checked);
+        incoming.Place(Caption("断句间隔"), 16, 47, 147, 30);
+        incoming.Place(new NumberFrame(incomingSentenceSilence), 167, 47, 148, 30);
+        help.SetToolTip(incomingSentenceSilence, "停顿达到这个时长后，百炼可结束当前句子。保存后从下一段来话识别开始生效。");
+        incoming.Place(Hint("保存后从下一段来话识别开始生效"), 330, 47, 384, 30);
         if (IncomingLoopbackCapture.UsesProcessLoopback)
         {
-            incoming.Place(Hint("采集 VRChat 的声音，音频交给百炼，文字交给所选翻译服务。"), 16, 42, 698, 26);
+            incoming.Place(Hint("采集 VRChat 的声音，音频交给百炼，文字交给所选翻译服务。"), 16, 81, 698, 26);
         }
         else
         {
-            incoming.Place(Caption("播放设备"), 16, 47, 147, 30);
-            incoming.Place(new ComboFrame(playback), 167, 47, 503, 30);
+            incoming.Place(Caption("播放设备"), 16, 81, 147, 30);
+            incoming.Place(new ComboFrame(playback), 167, 81, 503, 30);
             refreshPlayback.AccessibleName = "刷新播放设备";
             refreshPlayback.Click += (_, _) => ReloadPlaybackDevices(playback, SelectedPlayback);
-            incoming.Place(refreshPlayback, 681, 47, 33, 30);
-            incoming.Place(Hint("采集所选设备的全部声音。音频交给百炼，文字交给所选翻译服务。"), 16, 82, 698, 26);
+            incoming.Place(refreshPlayback, 681, 81, 33, 30);
+            incoming.Place(Hint("采集所选设备的全部声音。音频交给百炼，文字交给所选翻译服务。"), 16, 116, 698, 26);
         }
         return page;
     }
@@ -492,8 +581,9 @@ internal sealed class SettingsWindow : Form
     {
         var page = new SettingsPage();
         var speech = AddCard(page, 0, 0, 730, 97);
-        var voices = AddCard(page, 0, 110, 730, 120);
-        var playbackCard = AddCard(page, 0, 243, 730, 136);
+        var expression = AddCard(page, 0, 110, 730, 85);
+        var voices = AddCard(page, 0, 208, 730, 160);
+        var playbackCard = AddCard(page, 0, 381, 730, 136);
 
         speech.Place(Caption("启用自动播报"), 16, 9, 142, 30);
         speech.Place(speechEnabled, 161, 9, 52, 30);
@@ -507,12 +597,20 @@ internal sealed class SettingsWindow : Form
         speech.Place(new NumberFrame(speechVolume, pill: true), 629, 51, 85, 32);
         help.SetToolTip(volumeSlider, "同时调整输出设备和监听设备的音量。");
 
-        voices.Place(Caption("中文音色 ID"), 16, 10, 145, 30);
-        voices.Place(new TextFrame(voiceChinese), 167, 10, 547, 30);
-        voices.Place(Caption("英文音色 ID"), 16, 45, 145, 30);
-        voices.Place(new TextFrame(voiceEnglish), 167, 45, 547, 30);
-        voices.Place(Caption("日文音色 ID"), 16, 80, 145, 30);
-        voices.Place(new TextFrame(voiceJapanese), 167, 80, 547, 30);
+        speechExpression.Items.AddRange(SpeechExpression.Tags.ToArray());
+        expression.Place(Caption("播报语气"), 16, 6, 102, 32);
+        expression.Place(new ComboFrame(speechExpression), 121, 6, 245, 32);
+        expression.Place(MakeButton("关键词规则", SettingsButtonStyle.Outline, action: EditSpeechKeywords), 380, 6, 110, 32);
+        expression.Place(Hint("从下一句生效，保存后记住"), 502, 6, 213, 32);
+        expression.Place(Caption("播报语速"), 16, 46, 102, 32);
+        expression.Place(new NumberFrame(speechRate), 121, 46, 102, 32);
+        expression.Place(MakeButton("恢复 1.00×", action: () => speechRate.Value = 1m), 235, 46, 111, 32);
+        expression.Place(Hint("中文、英文和日文共用语速"), 362, 46, 300, 32);
+
+        voices.Place(MakeButton("音色管理", SettingsButtonStyle.Outline, action: ManageVoices), 566, 8, 148, 30);
+        VoiceRow(voices, voiceChinese, 48);
+        VoiceRow(voices, voiceEnglish, 83);
+        VoiceRow(voices, voiceJapanese, 118);
 
         playbackCard.Place(Caption("输出设备"), 16, 11, 145, 31);
         playbackCard.Place(new ComboFrame(speechOutput), 167, 11, 503, 31);
@@ -531,6 +629,72 @@ internal sealed class SettingsWindow : Form
         speechPreview.Click += (_, _) => runtime.PreviewSpeech(ReadSpeech());
         speechStop.Click += (_, _) => runtime.StopSpeech();
         return page;
+    }
+
+    private void VoiceRow(SettingsPage page, ComboBox picker, int y)
+    {
+        page.Place(Caption(picker.AccessibleName!), 16, y, 145, 30);
+        page.Place(new ComboFrame(picker), 167, y, 547, 30);
+        picker.SelectedIndexChanged += (_, _) => help.SetToolTip(picker, SelectedVoiceId(picker));
+    }
+
+    private static string SelectedVoiceId(ComboBox picker) => (picker.SelectedItem as SpeechVoiceChoice)?.Id ?? "";
+
+    private void EditSpeechKeywords()
+    {
+        using var dialog = new SpeechKeywordDialog(Font, speechKeywords);
+        dialog.Activated += (_, _) => runtime.SetKeyboardPaused(true);
+        dialog.Deactivate += (_, _) => runtime.SetKeyboardPaused(false);
+        keywordEditor = dialog;
+        try
+        {
+            if (dialog.ShowDialog(this) == DialogResult.OK)
+            {
+                speechKeywords = dialog.Rules;
+                ApplySpeechStyle();
+            }
+        }
+        finally { keywordEditor = null; }
+    }
+
+    private void ManageVoices()
+    {
+        using var dialog = new SpeechVoiceManager(Font, ReadSpeech(), runtime.SetKeyboardPaused);
+        voiceManager = dialog;
+        try
+        {
+            if (dialog.ShowDialog(this) == DialogResult.OK) LoadVoiceLibrary(dialog.Draft);
+        }
+        finally { voiceManager = null; }
+    }
+
+    private void LoadVoiceLibrary(SpeechSettings speech)
+    {
+        voiceLibrary = speech.Voices ?? [];
+        FillVoicePicker(voiceChinese, SpeechMode.ChineseOriginal, speech.ChineseVoice);
+        FillVoicePicker(voiceEnglish, SpeechMode.EnglishTranslation, speech.EnglishVoice);
+        FillVoicePicker(voiceJapanese, SpeechMode.JapaneseTranslation, speech.JapaneseVoice);
+    }
+
+    private void ReloadVoiceChoices()
+    {
+        FillVoicePicker(voiceChinese, SpeechMode.ChineseOriginal, SelectedVoiceId(voiceChinese));
+        FillVoicePicker(voiceEnglish, SpeechMode.EnglishTranslation, SelectedVoiceId(voiceEnglish));
+        FillVoicePicker(voiceJapanese, SpeechMode.JapaneseTranslation, SelectedVoiceId(voiceJapanese));
+    }
+
+    private void FillVoicePicker(ComboBox picker, SpeechMode mode, string selectedId)
+    {
+        var choices = SpeechVoiceCatalog.Choices(mode, (BailianRegion)bailianRegion.SelectedIndex, selectedId, voiceLibrary);
+        picker.BeginUpdate();
+        try
+        {
+            picker.Items.Clear();
+            picker.Items.AddRange(choices);
+            int selected = Array.FindIndex(choices, choice => choice.Id == selectedId);
+            picker.SelectedIndex = selected >= 0 ? selected : choices.Length - 1;
+        }
+        finally { picker.EndUpdate(); }
     }
 
     private void SubtitleRow(SettingsPage page, string label, NumericUpDown number, int y, bool fineAtStart = false)
@@ -566,20 +730,54 @@ internal sealed class SettingsWindow : Form
         return base.ProcessCmdKey(ref msg, keyData);
     }
 
+    private void EditHotwords()
+    {
+        using var dialog = new RecognitionVocabularyDialog(Font, recognitionHotwordsEnabled, recognitionHotwords, terminology,
+            (BailianRegion)bailianRegion.SelectedIndex);
+        dialog.Activated += (_, _) => runtime.SetKeyboardPaused(true);
+        dialog.Deactivate += (_, _) => runtime.SetKeyboardPaused(false);
+        hotwordEditor = dialog;
+        try
+        {
+            if (dialog.ShowDialog(this) != DialogResult.OK) return;
+            recognitionHotwords = dialog.Vocabulary;
+            recognitionHotwordsEnabled = dialog.HotwordsEnabled;
+            terminology = dialog.Terminology;
+            RefreshHotwordButton();
+        }
+        finally { hotwordEditor = null; }
+    }
+
+    private void RefreshHotwordButton()
+    {
+        hotwordButton.Text = !recognitionHotwordsEnabled ? "热词词库（已停用）"
+            : recognitionHotwords.Count > 0 ? $"热词词库（{recognitionHotwords.Count}）" : "热词词库";
+    }
+
     private void LoadValues(Settings settings)
     {
+        recognitionHotwords = settings.RecognitionHotwords;
+        recognitionHotwordsEnabled = settings.RecognitionHotwordsEnabled;
+        terminology = settings.Terminology;
+        RefreshHotwordButton();
         appearance.SelectedMode = settings.Appearance;
         ReloadDevices(settings.MicrophoneId);
         if (!IncomingLoopbackCapture.UsesProcessLoopback) ReloadPlaybackDevices(playback, settings.IncomingPlaybackDeviceId);
         incomingNoiseFilter.Checked = settings.IncomingStrongerNoiseFilter;
+        incomingSentenceSilence.Value = settings.IncomingSentenceSilenceMs;
         ReloadSpeechDevices(settings.Speech);
         speechEnabled.Checked = settings.Speech.Enabled;
         speechMonitor.Checked = settings.Speech.MonitorEnabled;
         speechMode.SelectedIndex = (int)settings.Speech.Mode;
-        voiceChinese.Text = settings.Speech.ChineseVoice;
-        voiceEnglish.Text = settings.Speech.EnglishVoice;
-        voiceJapanese.Text = settings.Speech.JapaneseVoice;
         speechVolume.Value = settings.Speech.VolumePercent;
+        speechRate.Value = settings.Speech.Rate;
+        speechKeywords = settings.Speech.Keywords;
+        speechExpression.SelectedItem = settings.Speech.Expression switch
+        {
+            SpeechExpression.Auto => speechExpression.Items[0],
+            SpeechExpression.Plain => speechExpression.Items[1],
+            var id => SpeechExpression.Tags.First(tag => tag.Id == id)
+        };
         key = settings.KeyboardVirtualKey;
         hotkey.Text = ((Keys)key).ToString();
         vrMode.SelectedIndex = (int)settings.VrBinding;
@@ -587,6 +785,7 @@ internal sealed class SettingsWindow : Form
         maxRecording.Value = settings.MaxRecordingSeconds;
         workspaceId.Text = settings.BailianWorkspaceId;
         bailianRegion.SelectedIndex = (int)settings.BailianRegion;
+        LoadVoiceLibrary(settings.Speech.Validate());
         bailianKey.Text = settings.BailianApiKey;
         deepLKey.Text = settings.DeepLApiKey;
         translationProvider.SelectedIndex = (int)settings.TranslationProvider;
@@ -613,10 +812,23 @@ internal sealed class SettingsWindow : Form
     private SpeechSettings ReadSpeech() => new()
     {
         Enabled = speechEnabled.Checked, Mode = (SpeechMode)speechMode.SelectedIndex,
-        ChineseVoice = voiceChinese.Text.Trim(), EnglishVoice = voiceEnglish.Text.Trim(), JapaneseVoice = voiceJapanese.Text.Trim(),
+        ChineseVoice = SelectedVoiceId(voiceChinese), EnglishVoice = SelectedVoiceId(voiceEnglish), JapaneseVoice = SelectedVoiceId(voiceJapanese),
+        Voices = voiceLibrary,
+        Rate = speechRate.Value, Keywords = speechKeywords,
+        Expression = SelectedExpression,
         VolumePercent = (int)speechVolume.Value, OutputDeviceId = (speechOutput.SelectedItem as CaptureDevice)?.Id,
         MonitorEnabled = speechMonitor.Checked, MonitorDeviceId = (speechMonitorDevice.SelectedItem as CaptureDevice)?.Id
     };
+
+    private string SelectedExpression => speechExpression.SelectedItem is SpeechTag tag ? tag.Id :
+        speechExpression.SelectedIndex == 1 ? SpeechExpression.Plain : SpeechExpression.Auto;
+
+    private void ApplySpeechStyle()
+    {
+        var current = runtime.Current;
+        runtime.Apply(current with { Speech = current.Speech with
+            { Expression = SelectedExpression, Keywords = speechKeywords, Rate = speechRate.Value } });
+    }
 
     private void ReloadSpeechDevices(SpeechSettings settings)
     {
@@ -631,18 +843,23 @@ internal sealed class SettingsWindow : Form
         {
             var updated = store.Save(new Settings
             {
+                Window = currentLayout,
                 Appearance = appearance.SelectedMode,
                 MicrophoneId = SelectedMicrophone, KeyboardVirtualKey = key, VrBinding = (VrBindingMode)vrMode.SelectedIndex,
                 IncomingPlaybackDeviceId = IncomingLoopbackCapture.UsesProcessLoopback ? runtime.Current.IncomingPlaybackDeviceId : SelectedPlayback,
                 IncomingStrongerNoiseFilter = incomingNoiseFilter.Checked,
+                IncomingSentenceSilenceMs = (int)incomingSentenceSilence.Value,
                 ExperimentalVrInputOverride = overrideInput.Checked, MaxRecordingSeconds = (int)maxRecording.Value,
                 BailianWorkspaceId = workspaceId.Text, BailianRegion = (BailianRegion)bailianRegion.SelectedIndex,
                 BailianApiKey = bailianKey.Text, DeepLApiKey = deepLKey.Text,
                 TranslationProvider = (TranslationProvider)translationProvider.SelectedIndex,
                 SourceLanguage = (SourceLanguage)source.SelectedIndex, TargetLanguages = targets.Codes.ToArray(),
+                RecognitionHotwords = recognitionHotwords, RecognitionHotwordsEnabled = recognitionHotwordsEnabled,
+                Terminology = terminology,
                 ChatboxEnabled = chatEnabled.Checked, OscPort = (int)oscPort.Value, Subtitles = ReadSubtitles(), Speech = ReadSpeech()
             });
             runtime.Apply(updated);
+            savedLayout = currentLayout;
             MaskPasswords();
             savedUntil = DateTime.UtcNow.AddSeconds(3);
             saved.Text = "设置已保存";
@@ -805,6 +1022,7 @@ internal sealed class SettingsWindow : Form
 
     private void ClosingSettings(object? sender, FormClosingEventArgs e)
     {
+        SaveWindowLayout();
         logWindow?.Close();
         previewing = false;
         previewButton.Text = "在 VR 中预览";

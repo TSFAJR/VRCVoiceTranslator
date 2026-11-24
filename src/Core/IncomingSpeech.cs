@@ -19,7 +19,10 @@ public sealed class IncomingSpeech(Settings settings, BailianClient asr, Transla
     {
         SingleReader = true, SingleWriter = true, FullMode = BoundedChannelFullMode.DropOldest
     }, _ => log("来话翻译繁忙，已跳过一条等待中的句子。"));
-    private IncomingTranslation? latest;
+    private readonly Channel<IncomingTranslation> completed = Channel.CreateBounded<IncomingTranslation>(new BoundedChannelOptions(1)
+    {
+        SingleWriter = true, FullMode = BoundedChannelFullMode.DropOldest
+    });
     private string? reconnectReason;
     private string? translationError;
     private string? outcome;
@@ -28,7 +31,7 @@ public sealed class IncomingSpeech(Settings settings, BailianClient asr, Transla
         Volatile.Read(ref translationError) is { } error ? $"翻译错误 · {error}" :
         Volatile.Read(ref outcome) is { } note ? $"正在监听 · {note}" : "正在监听";
 
-    public IncomingTranslation? TakeLatest() => Interlocked.Exchange(ref latest, null);
+    public IncomingTranslation? TakeNext() => completed.Reader.TryRead(out var translation) ? translation : null;
 
     public async Task RunAsync(IncomingAudio audio, CancellationToken cancellation)
     {
@@ -42,7 +45,7 @@ public sealed class IncomingSpeech(Settings settings, BailianClient asr, Transla
             lifetime.Cancel();
             try { await (first == recognizing ? translating : recognizing).ConfigureAwait(false); }
             catch (Exception) { /* The first task owns the termination reason. */ }
-            Interlocked.Exchange(ref latest, null);
+            while (completed.Reader.TryRead(out _)) { }
         }
     }
 
@@ -59,18 +62,22 @@ public sealed class IncomingSpeech(Settings settings, BailianClient asr, Transla
             string failure;
             try
             {
-                await asr.StreamSentencesAsync(CloudSettings(), audio.ReadSpeechAsync(utterance, taskLifetime.Token), sentence =>
+                var cloud = CloudSettings();
+                var audioFrames = audio.ReadSpeechAsync(utterance, cloud.IncomingSentenceSilenceMs, taskLifetime.Token);
+                await asr.StreamSentencesAsync(cloud, audioFrames, sentence =>
                 {
                     if (cancellation.IsCancellationRequested) return;
                     recognized = true;
                     consecutiveFailures = 0;
                     long recognizedAt = Stopwatch.GetTimestamp();
+                    string original = cloud.Terminology.Correct(sentence.Text, out int corrections);
                     if (sentence.EndMilliseconds is { } end)
                     {
                         double delay = Stopwatch.GetElapsedTime(utterance.StartTimestamp, recognizedAt).TotalMilliseconds - end;
-                        log($"来话句末至识别（估算）：{Math.Max(0, delay):F0} 毫秒");
+                        log($"来话句末至识别（估算）：{Math.Max(0, delay):F0} 毫秒，纠错 {corrections} 次");
                     }
-                    pending.Writer.TryWrite(new(sentence.Text, recognizedAt));
+                    else if (corrections > 0) log($"来话识别纠错 {corrections} 次。");
+                    pending.Writer.TryWrite(new(original, recognizedAt, cloud));
                 }, taskLifetime.Token, () => Volatile.Write(ref reconnectReason, null)).ConfigureAwait(false);
                 consecutiveFailures = 0;
                 if (!recognized) Note("最近一段未识别到完整语句");
@@ -106,8 +113,7 @@ public sealed class IncomingSpeech(Settings settings, BailianClient asr, Transla
             deadline.CancelAfter(remaining);
             try
             {
-                var cloud = CloudSettings();
-                var batch = await translator.TranslateAsync(sentence.Text, cloud, deadline.Token).ConfigureAwait(false);
+                var batch = await translator.TranslateAsync(sentence.Text, sentence.Settings, deadline.Token).ConfigureAwait(false);
                 deadline.Token.ThrowIfCancellationRequested();
                 if (batch.Errors.Count > 0) { SetTranslationError(batch.Errors[0]); continue; }
                 Volatile.Write(ref translationError, null);
@@ -117,8 +123,10 @@ public sealed class IncomingSpeech(Settings settings, BailianClient asr, Transla
                 else if (Stopwatch.GetElapsedTime(sentence.RecognizedAt, now) < TranslationDeadline)
                 {
                     Volatile.Write(ref outcome, null);
-                    Interlocked.Exchange(ref latest, new(translation.Text, sentence.RecognizedAt, now));
+                    completed.Writer.TryWrite(new(translation.Text, sentence.RecognizedAt, now));
                 }
+                if (batch.RequestedTermCount > 0)
+                    log($"来话识别至译文：{Stopwatch.GetElapsedTime(sentence.RecognizedAt, now).TotalMilliseconds:F0} 毫秒，术语 {batch.RequestedTermCount} 条");
             }
             catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
             { SetTranslationError("来话翻译超时。"); }
@@ -135,5 +143,5 @@ public sealed class IncomingSpeech(Settings settings, BailianClient asr, Transla
         if (Interlocked.Exchange(ref outcome, message) != message) log($"来话：{message}。");
     }
 
-    private readonly record struct PendingSentence(string Text, long RecognizedAt);
+    private readonly record struct PendingSentence(string Text, long RecognizedAt, Settings Settings);
 }

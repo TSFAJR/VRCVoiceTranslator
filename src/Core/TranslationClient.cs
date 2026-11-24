@@ -9,6 +9,7 @@ public sealed record VoiceResult(string Original, IReadOnlyList<Translation> Tra
 public sealed record TranslationBatch(IReadOnlyList<Translation> Results, IReadOnlyList<string> Errors)
 {
     public IReadOnlyList<string> Notices { get; init; } = [];
+    public int RequestedTermCount { get; init; }
 }
 
 public sealed class TranslationClient(HttpClient http, TimeSpan? timeout = null)
@@ -40,6 +41,7 @@ public sealed class TranslationClient(HttpClient http, TimeSpan? timeout = null)
 
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         deadline.CancelAfter(wait);
+        int requestedTermCount = 0;
         var tasks = targets.Select(TranslateTargetAsync).ToArray();
         try { await Task.WhenAll(tasks).WaitAsync(deadline.Token).ConfigureAwait(false); }
         catch (OperationCanceledException) when (!cancellation.IsCancellationRequested) { }
@@ -55,7 +57,7 @@ public sealed class TranslationClient(HttpClient http, TimeSpan? timeout = null)
             if (result.Error is { } error) errors.Add(error);
             if (result.Notice is { } notice) notices.Add(notice);
         }
-        return new(results, errors) { Notices = notices };
+        return new(results, errors) { Notices = notices, RequestedTermCount = requestedTermCount };
 
         async Task<Outcome> TranslateTargetAsync(string target)
         {
@@ -73,11 +75,18 @@ public sealed class TranslationClient(HttpClient http, TimeSpan? timeout = null)
                 string model = provider == TranslationProvider.QwenMtLite ? "qwen-mt-lite" : "qwen-mt-flash";
                 string code = QwenMtLanguages.Code(target);
                 if (!QwenMtLanguages.Supports(provider, code)) return new(null, $"{target} 不受 {model} 支持。");
+                var options = new Dictionary<string, object> { ["source_lang"] = qwenSource ?? "auto", ["target_lang"] = code };
+                var terms = settings.Terminology.MatchTerms(original, target);
+                if (terms.Count > 0)
+                {
+                    options["terms"] = terms.Select(term => new { source = term.Source, target = term.Target }).ToArray();
+                    Interlocked.Add(ref requestedTermCount, terms.Count);
+                }
                 var body = new
                 {
                     model,
                     messages = new[] { new { role = "user", content = original } },
-                    translation_options = new { source_lang = qwenSource ?? "auto", target_lang = code }
+                    translation_options = options
                 };
                 result = await RequestAsync(endpoint, "Bearer", settings.BailianApiKey, body, target, ParseQwen, deadline.Token)
                     .ConfigureAwait(false);

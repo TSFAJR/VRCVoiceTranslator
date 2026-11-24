@@ -27,11 +27,21 @@ SteamVR 未启动时，键盘热键、识别、翻译和 Chatbox 仍可工作。
 
 「识别与翻译」的「翻译服务」同时用于自己的语音、手动输入和来话翻译。DeepL 是升级后的默认选项，使用已保存的 DeepL API Free Key。`qwen-mt-flash` 和 `qwen-mt-lite` 复用百炼的 Workspace ID、地域和 API Key。Flash 支持更多语种，Lite 适合低延迟的日常对话。选到模型不支持的目标语种时，工具会提示原因，并继续翻译其余语种。Qwen-MT 将 `EN-US` 和 `EN-GB` 都映射为英语。 [Qwen-MT 模型与语种说明](https://docs.bailian.console.aliyun.com/zh/model-studio/machine-translation)
 
+## 识别热词
+
+打开「识别与翻译 → 热词词库」，逐行填写或粘贴经常认错的 Avatar 模型名、地图名和术语。默认权重为 4。先在词条后按 Tab，再输入 1–5 调整普通权重。`50` 为加强权重，最多可用于 50 条词；例如输入 `Kipfel`、按 Tab、再输入 `50`，用于在中英混说时提高该词的召回率。点「确定」后，在主窗口点「保存设置」。已启用的词条会随下一段麦克风或来话识别请求发送给百炼，日志会显示随请求发送的条数。关闭「使用识别热词」并保存，可以保留列表并对比识别效果。新加坡子业务空间请关闭热词开关。[百炼即时热词](https://help.aliyun.com/zh/model-studio/improve-asr-accuracy)
+
+- 「上下文与纠错」可填最多 200 字的识别语料，例如 `在 VRChat 里，全追是全身追踪的简称。`。语料随当前百炼请求发送。也可逐行填 `什么全锥 → 什么全追`。本地在最终识别后执行纠错，翻译、字幕、Chatbox 和中文原文播报使用纠正后的文字。
+- 「译文术语」每行填原词、目标语言代码和指定译法，用 Tab 分隔。每种目标语言分别设置，例如「全追」在 `EN-US` 用 `full-body tracking`，在 `JA` 用 `フルトラ`。Qwen-MT Flash 和 Lite 随现有翻译请求最多附带 8 条命中的术语。手动输入也可以使用指定译法。DeepL 使用纠正后的原文。
+- 新项默认留空，原有热词和权重继续使用。识别上下文、规则和译法均在保存后应用于下一次识别任务。[百炼 Message 上下文](https://help.aliyun.com/zh/model-studio/qwen-asr-message-client-events) · [Qwen-MT 术语干预](https://help.aliyun.com/zh/model-studio/machine-translation)
+
 ## 翻译其他玩家的语音
 
 启动 VRChat PC 版和 SteamVR，确认已保存百炼 Workspace ID、百炼 API Key 和「显示头显字幕」。若翻译服务选了 DeepL，还需填入 DeepL API Key。在「识别与翻译」打开「来话翻译」开关即可持续监听，运行状态显示在开关旁。关闭开关、退出 VRChat、停用头显字幕或退出工具都会停止。工具每次启动默认关闭来话翻译。
 
-来话使用自动语种识别，逐句翻译成简体中文，仅在自己的头显显示「来话」字幕。自己的发言字幕优先显示，来话只补显仍在有效期内的最新一句。来话和自己的录音独立使用已保存的云服务配置。来话约停顿 0.5 秒断句，连续有声音时也会把每段识别音频限制在约 10 秒。连续静音约 5 秒后暂停识别，有声音时自动继续。
+来话使用自动语种识别，逐句翻译成简体中文，仅在自己的头显显示以「对方：」开头的字幕。每次显示最新一句，长句自动换行完整显示。自己的发言字幕优先显示，之后补显仍在有效期内的最新来话。
+
+「识别与翻译 → 断句间隔」控制百炼判定句末所需的停顿，默认 300 毫秒，可设为 200–6000 毫秒。保存后从下一段来话识别开始生效。连续有声音时，每段识别音频也会限制在约 10 秒。默认连续静音约 5 秒后暂停识别，有声音时自动继续。
 
 - **Windows 11** 按进程采集 VRChat 的声音，包括游戏内的音乐和音效。
 - **Windows 10 22H2** 在「识别与翻译」选择 VRChat 实际使用的播放设备，例如 Virtual Desktop 的音频设备，再打开开关。同一设备播放的所有应用声音都可能被采集。想隔离其他应用时，可在 Windows「应用音量和设备首选项」把 VRChat 和其他应用分配到不同的播放设备。选择「Windows 默认播放设备」时，工具在每次开启时选取当时的默认设备。 [Microsoft 播放设备回环说明](https://learn.microsoft.com/en-us/windows/win32/coreaudio/loopback-recording)
@@ -42,7 +52,11 @@ SteamVR 未启动时，键盘热键、识别、翻译和 Chatbox 仍可工作。
 
 ## 语音播报
 
-在「语音播报」勾选「启用自动播报」并保存。升级后默认关闭，选中的模式默认为「中文原文」。三种模式可各自编辑音色 ID。「试听」使用当前界面的模式、音色、音量和输出设备，调用已保存百炼工作空间的真实 TTS 接口。总开关关闭时也可试听。
+在「语音播报」勾选「启用自动播报」并保存。升级后默认关闭，选中的模式默认为「中文原文」。中文、英文和日文各有一个音色下拉框。点「音色管理」可以添加、修改或删除音色，设置音色 ID、可选别名，并勾选它支持的语言。点「确定」回到主窗口后，从对应下拉框选择音色，再点「保存设置」。删掉正在使用的音色或取消对应语言时，该语种会显示「未选择音色」。已有配置的音色会自动加入列表。 [百炼官方音色列表](https://help.aliyun.com/zh/model-studio/qwen-audio-tts-voice-list)
+
+「播报语气」默认自动匹配关键词。例如说「太好了」时，中文原文和英日译文都可以用兴奋语气播报。点「关键词规则」可添加、修改或删除短语，清空后保存也会保留。每次发言取原文中匹配的最长短语，等长时取最先出现的。固定语气、关键词和语速从下一次录音或手动发送生效。点「保存设置」后下次启动会记住。选「原声」可停用标签。日志会分别标出试听和正式播报使用的语气。标签只用于合成音频。
+
+「播报语速」可设为 0.50–2.00 倍，中英日共用，默认为 1.00 倍。「试听」使用界面当前的模式、语气、语速、音色、音量和设备，调用已保存百炼工作空间的 TTS 接口。总开关关闭时也可试听。
 
 | 模式 | 播报内容 | 默认音色 |
 | --- | --- | --- |
@@ -52,7 +66,7 @@ SteamVR 未启动时，键盘热键、识别、翻译和 Chatbox 仍可工作。
 
 英文或日文模式需要在「识别与翻译」中加入对应目标语言。译文不可用时，本次播报会跳过，原因显示在「语音播报」页。每次开始新录音时，正在合成或播放的上一条播报会停止。百炼合成使用同一组工作空间地址和 API Key。自定义音色需要该工作空间的使用权限。 [百炼 Qwen-Audio-TTS WebSocket 指南](https://help.aliyun.com/zh/model-studio/qwen-audio-tts-websocket-api)
 
-开启自动播报后，在「Chatbox」手动输入并点击「翻译并发送」或按 `Ctrl+Enter`，也会按所选模式播报。原文模式读完整的输入文字，英日模式等对应译文。若此时正在录音，仍会发送 Chatbox 消息，本次手动播报跳过。
+开启自动播报后，在「Chatbox」手动输入并点击「翻译并发送」或按 `Ctrl+Enter`，也会按所选模式播报。原文模式读完整的输入文字，英日模式等对应译文。若此时正在录音，仍会发送 Chatbox 消息，本次手动播报跳过。启用 VR 字幕时，手动发送也会更新自己的头显字幕。
 
 输出设备默认使用 Windows 默认播放设备。只在自己耳机里听时，可选 Virtual Desktop 耳机输出。让房间里的人听见时，工具选虚拟声卡的 `CABLE Input`，VRChat 麦克风选 `CABLE Output`，并在游戏里开启传声。工具「麦克风与触发」仍选 PICO 或 Virtual Desktop 麦克风。
 
@@ -73,6 +87,7 @@ SteamVR 未启动时，键盘热键、识别、翻译和 Chatbox 仍可工作。
 | `microphoneId` | `null` 使用 Windows 默认麦克风，也可由设置界面保存具体设备 ID |
 | `incomingPlaybackDeviceId` | `null` 使用 Windows 默认播放设备，用于 Windows 10 来话回环 |
 | `incomingStrongerNoiseFilter` | `false`。开启后加强来话底噪过滤 |
+| `incomingSentenceSilenceMs` | `300`。来话断句用的静音间隔，范围 200–6000 毫秒 |
 | `keyboardVirtualKey` | `119`（`F8`），Windows 虚拟键码的十进制值 |
 | `vrBinding`, `experimentalVrInputOverride` | `"chord"`, `false`。双动作模式为 `"twoActions"` |
 | `maxRecordingSeconds` | `12`，范围 1–60 秒 |
@@ -80,12 +95,15 @@ SteamVR 未启动时，键盘热键、识别、翻译和 Chatbox 仍可工作。
 | `bailianApiKey`, `deepLApiKey` | 两把 Key 初始留空。Qwen-MT 使用百炼 API Key |
 | `translationProvider` | `"deepL"`。还可用 `"qwen-mt-flash"`、`"qwen-mt-lite"` |
 | `sourceLanguage`, `targetLanguages` | `"chinese"`, `["EN-US", "JA"]`。源语言还可用 `english`、`japanese`、`korean`、`auto` |
+| `recognitionHotwordsEnabled`, `recognitionHotwords` | `true`, `{}`。例如 `{"The Black Cat": 4, "桔梗": 3}` |
+| `terminology` | `context` 默认 `""`，`corrections` 默认 `[]`，每项有 `from`、`to`，`terms` 默认 `[]`，每项有 `source`、`targetLanguage`、`target`。 |
 | `chatboxEnabled`, `oscPort` | `true`, `9000` |
 | `subtitles.enabled`, `subtitles.showOriginal` | `true`, `false` |
 | `subtitles.durationSeconds`, `subtitles.fontPercent`, `subtitles.opacityPercent` | `3`, `100`, `90` |
 | `subtitles.downAngleDegrees`, `subtitles.distanceMeters` | `22`, `1.5`。负角度向上移动 |
 | `speech.enabled`, `speech.mode` | `false`, `"chineseOriginal"`。其他模式为 `"englishTranslation"`、`"japaneseTranslation"` |
 | `speech.chineseVoice`, `speech.englishVoice`, `speech.japaneseVoice` | 各模式独立的音色 ID |
+| `speech.voices` | 音色条目列表，每项包含 `id`、`alias` 和 `languages`，例如 `"chinese, japanese"` |
 | `speech.volumePercent`, `speech.outputDeviceId` | `100`, `null`。`null` 使用 Windows 默认播放设备 |
 | `speech.monitorEnabled`, `speech.monitorDeviceId` | `false`, `null`。监听设备默认使用 Windows 默认播放设备 |
 

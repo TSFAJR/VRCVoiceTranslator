@@ -9,17 +9,18 @@ public sealed class BailianTtsClient(Func<Settings, CancellationToken, Task<WebS
 {
     public const string Model = "qwen-audio-3.1-tts-flash";
     public const int SampleRate = 24000;
+    public const int MaxTextLength = 20000;
     private readonly Func<Settings, CancellationToken, Task<WebSocket>> open = connect ?? ConnectAsync;
     private readonly TimeSpan startupLimit = startupTimeout ?? TimeSpan.FromSeconds(8);
     private readonly TimeSpan responseLimit = responseTimeout ?? TimeSpan.FromSeconds(15);
 
     public async Task SynthesizeAsync(string text, Settings settings, Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask> receive,
-        CancellationToken cancellation)
+        CancellationToken cancellation, SpeechTag? tag = null)
     {
         if (BailianEndpoints.ConfigurationError(settings) is { } configurationError) throw new ServiceException(configurationError);
         var mode = settings.Speech.SelectMode();
         if (string.IsNullOrWhiteSpace(mode.Voice)) throw new ServiceException("请填写当前播报模式的音色 ID。");
-        if (string.IsNullOrWhiteSpace(text) || text.Length > 20000) throw new ServiceException("待播报文本为空或超过 20000 字符。");
+        if (string.IsNullOrWhiteSpace(text) || text.Length > MaxTextLength) throw new ServiceException($"待播报文本为空或超过 {MaxTextLength} 字符。");
 
         using var startup = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         using var response = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
@@ -29,11 +30,16 @@ public sealed class BailianTtsClient(Func<Settings, CancellationToken, Task<WebS
         {
             socket = await open(settings, startup.Token).ConfigureAwait(false);
             string id = Guid.NewGuid().ToString();
+            var parameters = new Dictionary<string, object>
+            {
+                ["text_type"] = "PlainText", ["voice"] = mode.Voice, ["format"] = "pcm", ["sample_rate"] = SampleRate,
+                ["rate"] = settings.Speech.Rate, ["language_hints"] = new[] { mode.Language }
+            };
+            if (tag?.Instruction(mode.Language) is { } instruction) parameters["instruction"] = instruction;
             await SendJsonAsync(socket, "run-task", id, new
             {
                 task_group = "audio", task = "tts", function = "SpeechSynthesizer", model = Model,
-                parameters = new { text_type = "PlainText", voice = mode.Voice, format = "pcm", sample_rate = SampleRate,
-                    language_hints = new[] { mode.Language } },
+                parameters,
                 input = new { }
             }, startup.Token).ConfigureAwait(false);
 
