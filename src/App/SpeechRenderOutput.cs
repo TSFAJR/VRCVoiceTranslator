@@ -10,15 +10,16 @@ internal sealed class SpeechRenderOutput
 {
     private readonly object startGate = new();
     private readonly TaskCompletionSource<string> endpoint = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    private readonly Channel<byte[]> audio = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(16)
-    { SingleReader = true, SingleWriter = true });
+    private readonly Channel<byte[]> audio;
     private readonly CancellationToken cancellation;
     private bool started;
     private int playing;
 
     public SpeechRenderOutput(string? selectedDevice, int volume, CancellationToken cancellation,
-        Action onStarted, Task<string>? skipDevice = null)
+        Action onStarted, Task<string>? skipDevice = null, int queueCapacity = 16)
     {
+        audio = Channel.CreateBounded<byte[]>(new BoundedChannelOptions(queueCapacity)
+        { SingleReader = true, SingleWriter = true });
         this.cancellation = cancellation;
         Work = Task.Factory.StartNew(() => Render(selectedDevice, volume, skipDevice, onStarted), CancellationToken.None,
             TaskCreationOptions.LongRunning, TaskScheduler.Default);
@@ -49,7 +50,7 @@ internal sealed class SpeechRenderOutput
             if (device.State != DeviceState.Active || device.DataFlow != DataFlow.Render)
                 throw new ServiceException("所选播报输出设备不可用，请重新选择。");
             string deviceId = device.ID;
-            endpoint.SetResult(deviceId);
+            endpoint.TrySetResult(deviceId);
             if (skipDevice is not null && string.Equals(deviceId, skipDevice.WaitAsync(cancellation).GetAwaiter().GetResult(),
                 StringComparison.OrdinalIgnoreCase)) return;
             using var signal = new AutoResetEvent(false);
@@ -61,7 +62,17 @@ internal sealed class SpeechRenderOutput
             Play(client, signal, volume, onStarted);
         }
         catch (Exception error) when (!cancellation.IsCancellationRequested && (error is COMException or ArgumentException))
-        { throw new ServiceException($"播报输出设备打开或播放失败，请检查设备连接（0x{error.HResult:X8}）。"); }
+        {
+            var failure = new ServiceException($"播报输出设备打开或播放失败，请检查设备连接（0x{error.HResult:X8}）。");
+            endpoint.TrySetException(failure);
+            throw failure;
+        }
+        catch (Exception error)
+        {
+            if (error is OperationCanceledException) endpoint.TrySetCanceled(cancellation);
+            else endpoint.TrySetException(error);
+            throw;
+        }
     }
 
     private void Play(AudioClient client, WaitHandle signal, int volume, Action onStarted)
@@ -99,7 +110,7 @@ internal sealed class SpeechRenderOutput
             if (started)
             {
                 try { client.Stop(); client.Reset(); }
-                catch (COMException) when (cancellation.IsCancellationRequested) { }
+                catch (COMException) { /* Device may already be invalidated during error or cancellation cleanup. */ }
             }
         }
 

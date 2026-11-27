@@ -14,8 +14,12 @@ public static class BailianEndpoints
     public static string? ConfigurationError(Settings settings)
     {
         if (!Enum.IsDefined(settings.BailianRegion) || !WorkspaceId.IsMatch(settings.BailianWorkspaceId)) return WorkspaceIdError;
-        return string.IsNullOrWhiteSpace(settings.BailianApiKey) ? "请填写百炼 API Key。" : null;
+        if (string.IsNullOrWhiteSpace(settings.BailianApiKey)) return "请填写百炼 API Key。";
+        return IsValidHeaderToken(settings.BailianApiKey) ? null : "百炼 API Key 包含无效字符，请重新粘贴。";
     }
+
+    internal static bool IsValidHeaderToken(string value) =>
+        value.Length > 0 && value.All(ch => ch is >= '!' and <= '~');
 
     public static Uri Audio(Settings settings) => new($"wss://{Host(settings)}/api-ws/v1/inference");
 

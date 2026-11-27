@@ -124,9 +124,10 @@ public sealed class IncomingSpeech(Settings settings, BailianClient asr, Transla
                 {
                     Volatile.Write(ref outcome, null);
                     completed.Writer.TryWrite(new(translation.Text, sentence.RecognizedAt, now));
+                    if (batch.RequestedTermCount > 0)
+                        log($"来话识别至译文：{Stopwatch.GetElapsedTime(sentence.RecognizedAt, now).TotalMilliseconds:F0} 毫秒，术语 {batch.RequestedTermCount} 条");
                 }
-                if (batch.RequestedTermCount > 0)
-                    log($"来话识别至译文：{Stopwatch.GetElapsedTime(sentence.RecognizedAt, now).TotalMilliseconds:F0} 毫秒，术语 {batch.RequestedTermCount} 条");
+                else Note("来话译文已过显示时限");
             }
             catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
             { SetTranslationError("来话翻译超时。"); }

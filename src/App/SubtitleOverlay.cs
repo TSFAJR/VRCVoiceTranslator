@@ -68,7 +68,8 @@ internal sealed class SubtitleOverlay(CVRSystem system, CVROverlay vr, string ke
         measure.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
         using var format = new StringFormat { Alignment = StringAlignment.Center, Trimming = StringTrimming.None };
         float fontSize = 44 * fontPercent / 100f;
-        var fontFamily = SystemFonts.MessageBoxFont!.FontFamily;
+        using var messageFont = SystemFonts.MessageBoxFont!;
+        using var fontFamily = messageFont.FontFamily;
         const int textWidth = Width - 2 * Padding;
         int height;
         while (true)
@@ -118,15 +119,25 @@ internal sealed class SubtitleOverlay(CVRSystem system, CVROverlay vr, string ke
 
     public void Destroy(bool disconnecting)
     {
-        if (handle != 0)
+        try
         {
-            var error = vr.DestroyOverlay(handle);
-            if (!disconnecting && error is not (EVROverlayError.InvalidHandle or EVROverlayError.UnknownOverlay))
-                Check(error, nameof(vr.DestroyOverlay));
+            if (handle != 0)
+            {
+                var error = vr.DestroyOverlay(handle);
+                if (!disconnecting && error is not (EVROverlayError.InvalidHandle or EVROverlayError.UnknownOverlay))
+                    Check(error, nameof(vr.DestroyOverlay));
+            }
         }
-        handle = 0;
-        texture?.Dispose();
-        texture = null;
+        finally
+        {
+            handle = 0;
+            visible = false;
+            textureText = null;
+            textureFont = 0;
+            layout = null;
+            texture?.Dispose();
+            texture = null;
+        }
     }
 
     public void Dispose() => Destroy(disconnecting: true);

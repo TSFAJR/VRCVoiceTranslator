@@ -1,6 +1,4 @@
 using System.Diagnostics;
-using System.Runtime.InteropServices;
-using Microsoft.Win32.SafeHandles;
 using VrcTranslator;
 
 namespace VrcTranslator.Desktop;
@@ -40,7 +38,7 @@ internal sealed class IncomingListener : IDisposable
             foreach (var process in candidates)
             {
                 if (process.SessionId != current.SessionId) continue;
-                var handle = ProcessExitHandle.TryOpen(process.Id);
+                var handle = ProcessExitHandle.TryOpen(process.Id, "VRChat");
                 if (handle is null) continue;
                 if (selected is not null && !selected.WaitOne(0))
                 {
@@ -91,31 +89,6 @@ internal sealed class IncomingListener : IDisposable
                 await ObserveAsync(pipeline).ConfigureAwait(false);
             }
         }
-    }
-
-    private sealed class ProcessExitHandle : WaitHandle
-    {
-        private ProcessExitHandle(SafeWaitHandle handle) => SafeWaitHandle = handle;
-
-        public static ProcessExitHandle? TryOpen(int processId)
-        {
-            const uint synchronize = 0x00100000;
-            var handle = OpenProcess(synchronize, false, processId);
-            if (handle.IsInvalid)
-            {
-                int error = Marshal.GetLastPInvokeError();
-                handle.Dispose();
-                if (error == 87) return null; // ERROR_INVALID_PARAMETER: the PID no longer exists.
-                throw new ServiceException($"无法监视 VRChat 进程退出（Win32 {error}）。");
-            }
-            var wait = new ProcessExitHandle(handle);
-            if (!wait.WaitOne(0)) return wait;
-            wait.Dispose();
-            return null;
-        }
-
-        [DllImport("kernel32.dll", ExactSpelling = true, SetLastError = true)]
-        private static extern SafeWaitHandle OpenProcess(uint desiredAccess, [MarshalAs(UnmanagedType.Bool)] bool inheritHandle, int processId);
     }
 
     private static async Task ObserveAsync(Task task)

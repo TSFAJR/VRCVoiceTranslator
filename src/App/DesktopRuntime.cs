@@ -23,12 +23,24 @@ internal sealed partial class DesktopRuntime : IDisposable
     private static readonly string PreviewWithOriginal = SubtitlePresentation.Text(PreviewExample, showOriginal: true);
     private readonly Stopwatch clock = Stopwatch.StartNew();
     private readonly CancellationTokenSource exiting = new();
+    private readonly AutoResetEvent controlSignal = new(false);
     private readonly ConcurrentQueue<Action> controls = new();
     private readonly TriggerGate gate = new();
     private readonly SubtitlePresentation subtitles = new();
     private readonly BailianClient asr;
     private readonly BailianTtsClient tts = new();
-    private readonly HttpClient http = new(new HttpClientHandler { AllowAutoRedirect = false }) { Timeout = Timeout.InfiniteTimeSpan };
+    private readonly HttpClient http = new(new SocketsHttpHandler
+    {
+        AllowAutoRedirect = false,
+        PooledConnectionIdleTimeout = TimeSpan.FromSeconds(45),
+        PooledConnectionLifetime = TimeSpan.FromMinutes(10),
+        ConnectTimeout = TimeSpan.FromSeconds(2),
+        KeepAlivePingPolicy = HttpKeepAlivePingPolicy.WithActiveRequests,
+        KeepAlivePingDelay = TimeSpan.FromSeconds(15),
+        KeepAlivePingTimeout = TimeSpan.FromSeconds(5),
+        EnableMultipleHttp2Connections = true
+    })
+    { Timeout = Timeout.InfiniteTimeSpan };
     private readonly TranslationClient translate;
     private readonly ActivityLog log;
     private readonly SteamVr vr;
@@ -39,10 +51,15 @@ internal sealed partial class DesktopRuntime : IDisposable
     private bool keyboardPaused;
     private bool wasPreviewing;
     private string? lastOverlayError;
+    private string? lastTickError;
     private int overlayRetryMs;
     private TimeSpan nextOverlayAttempt;
     private RecordingSession? active;
+    private long activeSpeechGeneration;
     private SpeechPlayback? playback;
+    private PreparedSocket? preparedSpeech;
+    private long preparedSpeechGeneration;
+    private readonly List<Task> retiringSpeech = [];
     private long speechGeneration;
     private DesktopStatus status = new(VoicePhase.Idle, "等待 SteamVR", "", "", "");
     private Task? micTest;
@@ -66,29 +83,39 @@ internal sealed partial class DesktopRuntime : IDisposable
     public DesktopStatus Status => Volatile.Read(ref status);
     public int Meter => Volatile.Read(ref meter);
     public bool MicTestActive => Volatile.Read(ref micTest) is { IsCompleted: false };
-    public void Apply(Settings value)
+    public void Apply(Settings value, bool clearError = false)
     {
         var previous = Interlocked.Exchange(ref settings, value);
-        if (previous.Speech.Enabled && !value.Speech.Enabled) controls.Enqueue(() => InterruptSpeech("自动播报已关闭"));
+        if (clearError) Post(() => SetStatus(s => s with { Error = "" }));
+        if (previous.Speech.Enabled && !value.Speech.Enabled) Post(() => InterruptSpeech("自动播报已关闭"));
     }
     public void Preview(SubtitleSettings? value) => Volatile.Write(ref preview, value);
     public void SetKeyboardPaused(bool paused) => Volatile.Write(ref keyboardPaused, paused);
-    public void OpenBindings() => controls.Enqueue(vr.OpenBindings);
-    public void StopMicTest() => controls.Enqueue(StopTest);
-    public void StopSpeech() => controls.Enqueue(() => InterruptSpeech("已停止"));
-    public void PreviewSpeech(SpeechSettings options) => controls.Enqueue(() =>
+    public void OpenBindings() => Post(() =>
+    {
+        SetStatus(s => s with { Error = "" });
+        vr.OpenBindings();
+    });
+    public void StopMicTest() => Post(StopTest);
+    public void StopSpeech() => Post(() => InterruptSpeech("已停止"));
+    public void PreviewSpeech(SpeechSettings options) => Post(() =>
     {
         if (gate.Capturing) { SetSpeechStatus("请在本次录音结束后试听", false); return; }
+        SetStatus(s => s with { Error = "" });
         InterruptSpeech();
         StartSpeech(options.PreviewSpeech(), Current with { Speech = options }, Stopwatch.GetTimestamp(), "试听");
     });
-    public void SetIncoming(bool enabled, string? playbackDeviceId, bool strongerNoiseFilter) => controls.Enqueue(() =>
+    public void SetIncoming(bool enabled, string? playbackDeviceId, bool strongerNoiseFilter) => Post(() =>
     {
         if (enabled) StartIncoming(playbackDeviceId, strongerNoiseFilter);
         else StopIncoming("已关闭");
     });
 
-    public void TestChatbox(int port) => controls.Enqueue(() => SendChatbox(() => Chatbox.Format(Chatbox.Example), port));
+    public void TestChatbox(int port) => Post(() =>
+    {
+        SetStatus(s => s with { Error = "", TranslationNotice = "" });
+        SendChatbox(() => Chatbox.Format(Chatbox.Example), port);
+    });
 
     public async Task<bool> SendManualChatboxAsync(string text, int port)
     {
@@ -98,9 +125,10 @@ internal sealed partial class DesktopRuntime : IDisposable
         var snapshot = Current;
         long started = Stopwatch.GetTimestamp();
         TranslationBatch batch;
+        long? generation = null;
         try
         {
-            long? generation = snapshot.Speech.Enabled ? await ReserveManualSpeechAsync(cancellation).ConfigureAwait(false) : null;
+            generation = snapshot.Speech.Enabled ? await ReserveManualSpeechAsync(snapshot, cancellation).ConfigureAwait(false) : null;
             batch = generation is { } ticket
                 ? await TakeTranslation.TranslateAsync(translate, original, snapshot,
                     selection => QueueSpeech(selection, snapshot, ticket), cancellation).ConfigureAwait(false)
@@ -108,19 +136,21 @@ internal sealed partial class DesktopRuntime : IDisposable
         }
         catch (Exception error) when (error is not OperationCanceledException)
         {
+            if (generation is { } failedTicket) Post(() => DiscardPreparedSpeech(failedTicket));
             batch = new([], [$"翻译请求失败（{error.GetType().Name}）。"]);
         }
         cancellation.ThrowIfCancellationRequested();
         double elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds;
 
         var result = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
-        controls.Enqueue(() =>
+        Post(() =>
         {
             if (cancellation.IsCancellationRequested)
             {
                 result.TrySetCanceled(cancellation);
                 return;
             }
+            SetStatus(s => s with { Error = "" });
             if (batch.Errors.Count > 0)
                 ReportError(new ServiceException(string.Join("  ", batch.Errors)), "文字翻译");
             ShowTranslationNotices(batch.Notices);
@@ -134,10 +164,10 @@ internal sealed partial class DesktopRuntime : IDisposable
         return await result.Task.WaitAsync(cancellation).ConfigureAwait(false);
     }
 
-    private Task<long?> ReserveManualSpeechAsync(CancellationToken cancellation)
+    private Task<long?> ReserveManualSpeechAsync(Settings snapshot, CancellationToken cancellation)
     {
         var reservation = new TaskCompletionSource<long?>(TaskCreationOptions.RunContinuationsAsynchronously);
-        controls.Enqueue(() =>
+        Post(() =>
         {
             if (gate.Capturing || cancellation.IsCancellationRequested || !Current.Speech.Enabled)
             {
@@ -145,20 +175,22 @@ internal sealed partial class DesktopRuntime : IDisposable
                 return;
             }
             InterruptSpeech();
+            if (snapshot.Speech.SelectMode().Target is not null) PrepareSpeech(snapshot, speechGeneration);
             reservation.SetResult(speechGeneration);
         });
         return reservation.Task.WaitAsync(cancellation);
     }
 
-    public void TestMicrophone(string? deviceId) => controls.Enqueue(() =>
+    public void TestMicrophone(string? deviceId) => Post(() =>
     {
         if (active is not null) throw new ServiceException("请等本次语音处理完成后再测试麦克风。");
         StopTest();
         if (micTest is { IsCompleted: false }) throw new ServiceException("请等待上一次麦克风测试停止。");
+        SetStatus(s => s with { Error = "" });
         micTestStop?.Dispose();
         micTestStop = new CancellationTokenSource(TimeSpan.FromSeconds(15));
         var token = micTestStop.Token;
-        micTest = Task.Run(async () =>
+        Volatile.Write(ref micTest, Task.Run(async () =>
         {
             try
             {
@@ -168,14 +200,22 @@ internal sealed partial class DesktopRuntime : IDisposable
                 if (!token.IsCancellationRequested) throw new ServiceException("麦克风测试意外停止。");
             }
             catch (OperationCanceledException) when (token.IsCancellationRequested) { }
-            catch (Exception error) { controls.Enqueue(() => ReportError(error, "麦克风测试")); }
+            catch (Exception error) { Post(() => ReportError(error, "麦克风测试")); }
             finally { Volatile.Write(ref meter, 0); }
-        });
+        }));
     });
+
+    private void Post(Action action)
+    {
+        controls.Enqueue(action);
+        try { controlSignal.Set(); }
+        catch (ObjectDisposedException) { }
+    }
 
     private void Run()
     {
         log.Write("托盘工具已启动。");
+        WaitHandle[] wake = [exiting.Token.WaitHandle, controlSignal];
         try
         {
             while (!exiting.IsCancellationRequested)
@@ -185,9 +225,17 @@ internal sealed partial class DesktopRuntime : IDisposable
                     try { action(); }
                     catch (Exception error) { ReportError(error, "设置操作"); }
                 }
-                try { Tick(); }
-                catch (Exception error) { ReportError(error, "后台任务"); }
-                exiting.Token.WaitHandle.WaitOne(12);
+                try
+                {
+                    Tick();
+                    lastTickError = null;
+                }
+                catch (Exception error)
+                {
+                    if (lastTickError != error.Message) ReportError(error, "后台任务");
+                    lastTickError = error.Message;
+                }
+                WaitHandle.WaitAny(wake, 12);
             }
         }
         finally
@@ -199,6 +247,8 @@ internal sealed partial class DesktopRuntime : IDisposable
             WaitForShutdown(micTest);
             WaitForShutdown(active?.Work);
             WaitForShutdown(stoppingIncoming?.Work);
+            foreach (var task in retiringSpeech) WaitForShutdown(task);
+            retiringSpeech.Clear();
             stoppingIncoming?.Dispose();
             active?.Dispose();
             micTestStop?.Dispose();
@@ -230,6 +280,8 @@ internal sealed partial class DesktopRuntime : IDisposable
                 InterruptSpeech();
                 subtitles.ClearOutgoing();
                 long generation = speechGeneration;
+                activeSpeechGeneration = generation;
+                PrepareSpeech(inputSettings, generation);
                 SetStatus(s => s with { Error = "", TranslationNotice = "" });
                 active = new RecordingSession(inputSettings, asr, translate, log.Write,
                     selection => QueueSpeech(selection, inputSettings, generation));
@@ -255,36 +307,68 @@ internal sealed partial class DesktopRuntime : IDisposable
             SetStatus(s => s with { Phase = phase, Vr = vrText, Binding = vrStatus });
     }
 
+    private void PrepareSpeech(Settings snapshot, long generation)
+    {
+        DiscardPreparedSpeech();
+        preparedSpeech = tts.Prepare(snapshot);
+        preparedSpeechGeneration = generation;
+    }
+
+    private PreparedSocket? TakePreparedSpeech(long generation)
+    {
+        if (preparedSpeech is null || preparedSpeechGeneration != generation) return null;
+        var socket = preparedSpeech;
+        preparedSpeech = null;
+        return socket;
+    }
+
+    private void DiscardPreparedSpeech(long? generation = null)
+    {
+        if (preparedSpeech is null || (generation is { } target && preparedSpeechGeneration != target)) return;
+        preparedSpeech.Dispose();
+        preparedSpeech = null;
+    }
+
     private void QueueSpeech(SpeechSelection selection, Settings snapshot, long generation)
     {
         long readyAt = Stopwatch.GetTimestamp();
-        controls.Enqueue(() =>
+        Post(() =>
         {
-            if (generation != speechGeneration || !Current.Speech.Enabled) return;
-            if (selection.Text is not null) StartSpeech(selection, snapshot, readyAt, "正式播报");
-            else if (selection.SkipReason is { } reason)
+            var prepared = TakePreparedSpeech(generation);
+            if (generation != speechGeneration || !Current.Speech.Enabled)
             {
-                SetSpeechStatus(reason, false);
-                log.Write(reason);
+                prepared?.Dispose();
+                return;
+            }
+            if (selection.Text is not null) StartSpeech(selection, snapshot, readyAt, "正式播报", prepared);
+            else
+            {
+                prepared?.Dispose();
+                if (selection.SkipReason is { } reason)
+                {
+                    SetSpeechStatus(reason, false);
+                    log.Write(reason);
+                }
             }
         });
     }
 
-    private void StartSpeech(SpeechSelection selection, Settings snapshot, long readyAt, string source)
+    private void StartSpeech(SpeechSelection selection, Settings snapshot, long readyAt, string source, PreparedSocket? prepared = null)
     {
         log.Write($"{source} · {snapshot.Speech.SelectMode().Language} · 语气 {selection.Tag?.Label ?? "原声"} · {snapshot.Speech.Rate:0.00}×");
-        playback = new SpeechPlayback(tts, selection, snapshot, readyAt, log.Write);
+        playback = new SpeechPlayback(tts, selection, snapshot, readyAt, log.Write, prepared);
         SetSpeechStatus("正在合成", true);
     }
 
     private void InterruptSpeech(string? state = null)
     {
         speechGeneration++;
+        DiscardPreparedSpeech();
         if (playback is { } previous)
         {
             playback = null;
             previous.Stop();
-            _ = DisposeInterruptedAsync(previous);
+            retiringSpeech.Add(DisposeInterruptedAsync(previous));
             state ??= "已停止";
         }
         if (state is not null) SetSpeechStatus(state, false);
@@ -301,6 +385,7 @@ internal sealed partial class DesktopRuntime : IDisposable
 
     private void UpdateSpeech()
     {
+        retiringSpeech.RemoveAll(static task => task.IsCompleted);
         if (playback is not { } job) return;
         if (!job.Work.IsCompleted) { SetSpeechStatus(job.Status, true); return; }
         playback = null;
@@ -425,14 +510,15 @@ internal sealed partial class DesktopRuntime : IDisposable
             }
             if (take.Result is not { } result)
             {
+                DiscardPreparedSpeech(activeSpeechGeneration);
                 log.Write("识别结果为空。");
                 return;
             }
             if (current.ChatboxEnabled) SendChatbox(() => Chatbox.Format(result), current.OscPort);
             PresentOutgoing(result, current.Subtitles);
         }
-        catch (OperationCanceledException) { log.Write("录音已取消。"); }
-        catch (Exception error) { ReportError(error, "语音处理"); }
+        catch (OperationCanceledException) { DiscardPreparedSpeech(activeSpeechGeneration); log.Write("录音已取消。"); }
+        catch (Exception error) { DiscardPreparedSpeech(activeSpeechGeneration); ReportError(error, "语音处理"); }
     }
 
     private void PresentOutgoing(VoiceResult result, SubtitleSettings options)
@@ -485,7 +571,10 @@ internal sealed partial class DesktopRuntime : IDisposable
                 lastOverlayError = "请先连接 SteamVR 再预览字幕。";
                 ReportError(new ServiceException(lastOverlayError), "VR 字幕");
             }
-            else if (draft is null) lastOverlayError = null;
+            else if (draft is null && lastOverlayError is not null)
+            {
+                ClearOverlayError();
+            }
             return;
         }
         var now = clock.Elapsed;
@@ -500,8 +589,11 @@ internal sealed partial class DesktopRuntime : IDisposable
                 vr.Show(text, draft ?? current);
                 if (draft is null && subtitles.MarkShown(clock.Elapsed, current.DurationSeconds) is long recognizedAt)
                     log.Write($"来话识别至字幕：{Stopwatch.GetElapsedTime(recognizedAt).TotalMilliseconds:F0} 毫秒");
-                if (lastOverlayError is not null) log.Write("SteamVR 字幕已恢复显示。");
-                lastOverlayError = null;
+                if (lastOverlayError is not null)
+                {
+                    log.Write("SteamVR 字幕已恢复显示。");
+                    ClearOverlayError();
+                }
             }
             else vr.Hide();
             overlayRetryMs = 0;
@@ -515,6 +607,13 @@ internal sealed partial class DesktopRuntime : IDisposable
         }
     }
 
+    private void ClearOverlayError()
+    {
+        if (lastOverlayError is not null && status.Error == $"VR 字幕：{lastOverlayError}")
+            SetStatus(s => s with { Error = "" });
+        lastOverlayError = null;
+    }
+
     private void StopTest()
     {
         micTestStop?.Cancel();
@@ -525,8 +624,7 @@ internal sealed partial class DesktopRuntime : IDisposable
     {
         string detail = exception is ServiceException ? exception.Message : $"{exception.GetType().Name} / 0x{exception.HResult:X8}";
         string message = $"{operation}：{detail}";
-        if (status.Error.Contains(message, StringComparison.Ordinal)) return;
-        SetStatus(s => s with { Error = s.Error.Length == 0 ? message : s.Error + "  " + message });
+        SetStatus(s => s with { Error = message });
         log.Write(message);
     }
 
@@ -542,6 +640,7 @@ internal sealed partial class DesktopRuntime : IDisposable
     {
         exiting.Cancel();
         worker.Join();
+        controlSignal.Dispose();
         exiting.Dispose();
         http.Dispose();
     }

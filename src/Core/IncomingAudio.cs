@@ -129,8 +129,8 @@ public sealed class IncomingAudio(bool strongerNoiseFilter = false)
         // A level gate at about -48 dBFS, or -42 dBFS with stronger filtering.
         var samples = MemoryMarshal.Cast<byte, short>(pcm);
         long energy = 0;
-        foreach (short sample in samples) energy += sample * sample;
-        return energy >= samples.Length * gateLevel * gateLevel;
+        foreach (short sample in samples) energy += (long)sample * sample;
+        return energy >= (long)samples.Length * gateLevel * gateLevel;
     }
 
     internal readonly record struct Frame(long Number, byte[] Pcm, long CapturedAt);

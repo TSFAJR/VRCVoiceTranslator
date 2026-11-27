@@ -21,7 +21,7 @@ internal sealed class SteamVr(Action<string> log) : IDisposable
     private CVRSystem? system;
     private CVRInput? input;
     private SubtitleOverlay? overlay;
-    private Process? server;
+    private ProcessExitHandle? server;
     private TimeSpan nextConnect;
     private TimeSpan nextSetup;
     private TimeSpan nextBindingCheck;
@@ -54,7 +54,7 @@ internal sealed class SteamVr(Action<string> log) : IDisposable
     {
         if (system is null && now >= nextConnect) Connect(now);
         if (system is null) return new(false, false, default, lastConnectError ?? "等待 SteamVR");
-        if (server is null || server.HasExited)
+        if (server is not null && server.WaitOne(0))
         {
             Disconnect(now);
             return new(false, false, default, "SteamVR 已退出");
@@ -163,10 +163,25 @@ internal sealed class SteamVr(Action<string> log) : IDisposable
     {
         nextConnect = now + TimeSpan.FromSeconds(2);
         // Keep the desktop-only workflow available without launching SteamVR from the tray.
+        using var current = Process.GetCurrentProcess();
         var candidates = Process.GetProcessesByName("vrserver");
-        if (candidates.Length == 0) return;
-        server = candidates[0];
-        foreach (var other in candidates.Skip(1)) other.Dispose();
+        bool foundInSession = false;
+        ProcessExitHandle? handle = null;
+        try
+        {
+            foreach (var candidate in candidates)
+            {
+                if (candidate.SessionId != current.SessionId) continue;
+                foundInSession = true;
+                handle ??= ProcessExitHandle.TryOpen(candidate.Id, "SteamVR", ignoreAccessDenied: true);
+            }
+        }
+        finally
+        {
+            foreach (var candidate in candidates) candidate.Dispose();
+        }
+        if (!foundInSession) { handle?.Dispose(); return; }
+        server = handle;
         var error = EVRInitError.None;
         system = OpenVR.Init(ref error, EVRApplicationType.VRApplication_Overlay);
         if (error != EVRInitError.None || system is null)
@@ -254,8 +269,9 @@ internal sealed class SteamVr(Action<string> log) : IDisposable
 
     public void ResetOverlay()
     {
-        overlay?.Destroy(disconnecting: false);
+        var current = overlay;
         overlay = null;
+        current?.Destroy(disconnecting: false);
     }
 
     private void Disconnect(TimeSpan now)

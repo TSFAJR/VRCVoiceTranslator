@@ -47,7 +47,10 @@ var tests = new (string Name, Func<Task> Run)[]
     ("Settings defaults, save, external edit and malformed preservation", ConfigRoundTrip),
     ("Window resize persists independently and preserves external settings", WindowLayoutPersistence),
     ("Hotword text import validates terms and weights", HotwordImport),
-    ("Bailian Workspace ID endpoints and legacy migration", WorkspaceMigration)
+    ("Bailian Workspace ID endpoints and legacy migration", WorkspaceMigration),
+    ("Invalid API key characters and unvalidated expression fallback fail cleanly", InvalidCredentialsAndFallback),
+    ("TTS pre-connect reuses open socket, falls back on stale close, and cleans up unused", TtsPreconnect),
+    ("ASR startup retry preserves audio and translation retries transient transport drops", StartupAndTransportRetries)
 };
 int failures = 0;
 foreach (var test in tests)
@@ -1304,6 +1307,10 @@ static Task WindowLayoutPersistence()
         File.WriteAllText(store.Path, invalid);
         _ = Throws<FormatException>(() => store.SaveWindow(layout));
         Equal(invalid, File.ReadAllText(store.Path));
+        const string broken = "{\"oscPort\":";
+        File.WriteAllText(store.Path, broken);
+        True(Throws<FormatException>(() => store.SaveWindow(layout)).Message.Contains(store.Path));
+        Equal(broken, File.ReadAllText(store.Path));
     }
     finally { File.Delete(store.Path); directory.Delete(); }
     return Task.CompletedTask;
@@ -1457,6 +1464,173 @@ static Task WorkspaceMigration()
     return Task.CompletedTask;
 }
 
+static async Task InvalidCredentialsAndFallback()
+{
+    var badBailian = CloudSettings() with { BailianApiKey = "sk-bad\nkey" };
+    True(BailianEndpoints.ConfigurationError(badBailian)?.Contains("无效字符") == true);
+    var asrError = await ThrowsAsync<ServiceException>(() => new BailianClient((_, _) => throw new Exception("Should not connect"))
+        .RecognizeAsync(badBailian, AsyncEnumerable.Empty<byte[]>(), CancellationToken.None));
+    True(asrError.Message.Contains("无效字符"));
+    var ttsError = await ThrowsAsync<ServiceException>(() => new BailianTtsClient((_, _) => throw new Exception("Should not connect"))
+        .SynthesizeAsync("你好", badBailian, (_, _) => ValueTask.CompletedTask, CancellationToken.None));
+    True(ttsError.Message.Contains("无效字符"));
+
+    var badDeepL = CloudSettings() with { DeepLApiKey = "key with space" };
+    using var http = FakeHttp((_, _) => throw new Exception("Should not send"));
+    var batch = await new TranslationClient(http).TranslateAsync("你好", badDeepL, CancellationToken.None);
+    True(batch.Errors.Single().Contains("无效字符"));
+
+    // Unvalidated speech expression falls back safely to plain spoken text.
+    var fallback = SpeechExpression.Select(new SpeechSettings { Expression = "removed-tag" }, "太好了", "spoken");
+    Equal(new SpeechSelection("spoken", null), fallback);
+
+    // Late HTTP response after TranslationClient deadline disposal does not invoke callback or fault.
+    var late = new TaskCompletionSource<HttpResponseMessage>(TaskCreationOptions.RunContinuationsAsynchronously);
+    using var slowHttp = FakeHttp((_, _) => late.Task);
+    int callbacks = 0;
+    var timedOut = await new TranslationClient(slowHttp, TimeSpan.FromMilliseconds(30))
+        .TranslateAsync("原文", CloudSettings() with { TargetLanguages = ["EN-US"] }, CancellationToken.None, _ => Interlocked.Increment(ref callbacks));
+    True(timedOut.Errors.Single().Contains("超时"));
+    late.SetResult(TranslationResponse("ZH", "Late"));
+    await Task.Delay(30);
+    Equal(0, Volatile.Read(ref callbacks));
+}
+
+static async Task TtsPreconnect()
+{
+    var disabled = CloudSettings() with { Speech = new() { Enabled = false } };
+    var enabled = CloudSettings() with { Speech = new() { Enabled = true } };
+    Equal<PreparedSocket?>(null, new BailianTtsClient((_, _) => throw new Exception("Should not connect")).Prepare(disabled));
+    Equal<PreparedSocket?>(null, new BailianTtsClient((_, _) => throw new Exception("Should not connect"))
+        .Prepare(enabled with { Speech = enabled.Speech with { ChineseVoice = "" } }));
+
+    // 1. Pre-connected socket hit: only 1 connection is created and reused.
+    using (var preSocket = new FakeSocket())
+    {
+        int connections = 0;
+        var tts = new BailianTtsClient((_, _) =>
+        {
+            Interlocked.Increment(ref connections);
+            return Task.FromResult<WebSocket>(preSocket);
+        });
+        using var prepared = tts.Prepare(enabled)!;
+        True(prepared is not null);
+        bool? hit = null;
+        var blocks = Channel.CreateUnbounded<byte[]>();
+        var work = tts.SynthesizeAsync("你好", enabled, (pcm, token) => blocks.Writer.WriteAsync(pcm.ToArray(), token),
+            CancellationToken.None, prepared: prepared, onConnected: value => hit = value);
+        string id = await preSocket.TaskId();
+        preSocket.Event("task-started", id);
+        await CheckTtsSend(preSocket, id, "你好");
+        preSocket.Binary([1, 2]);
+        Equal("0102", Convert.ToHexString(await blocks.Reader.ReadAsync()));
+        preSocket.Event("task-finished", id);
+        await work;
+        Equal(1, Volatile.Read(ref connections));
+        Equal<bool?>(true, hit);
+    }
+
+    // 2. Stale pre-connected socket closes before task-started -> transparently retries on a fresh socket.
+    using (var stale = new FakeSocket())
+    using (var fresh = new FakeSocket())
+    {
+        int connections = 0;
+        var tts = new BailianTtsClient((_, _) => Task.FromResult<WebSocket>(Interlocked.Increment(ref connections) == 1 ? stale : fresh));
+        using var prepared = tts.Prepare(enabled)!;
+        var hits = new List<bool>();
+        var work = tts.SynthesizeAsync("重试", enabled, (_, _) => ValueTask.CompletedTask,
+            CancellationToken.None, prepared: prepared, onConnected: hits.Add);
+        _ = await stale.TaskId();
+        stale.CloseFromServer();
+        string freshId = await fresh.TaskId();
+        fresh.Event("task-started", freshId);
+        await CheckTtsSend(fresh, freshId, "重试");
+        fresh.Binary([3, 4]);
+        fresh.Event("task-finished", freshId);
+        await work;
+        Equal(2, Volatile.Read(ref connections));
+        Equal("True,False", string.Join(',', hits));
+        Equal(WebSocketState.Aborted, stale.State);
+    }
+
+    // 3. Unused prepared socket that finishes late after Dispose is aborted and disposed.
+    using (var lateSocket = new FakeSocket())
+    {
+        var gate = new TaskCompletionSource<WebSocket>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var tts = new BailianTtsClient((_, _) => gate.Task);
+        var prepared = tts.Prepare(enabled)!;
+        prepared.Dispose();
+        gate.SetResult(lateSocket);
+        for (int i = 0; i < 50 && lateSocket.State != WebSocketState.Aborted; i++) await Task.Delay(10);
+        Equal(WebSocketState.Aborted, lateSocket.State);
+    }
+}
+
+static async Task StartupAndTransportRetries()
+{
+    // 1. ASR startup retry: attempt 0 stalls before task-started, attempt 1 succeeds with all buffered audio intact.
+    using (var stalled = new FakeSocket())
+    using (var healthy = new FakeSocket())
+    {
+        int connections = 0;
+        var logs = new List<string>();
+        var audio = Channel.CreateUnbounded<byte[]>();
+        byte[] sample = [0x11, 0x22, 0x33, 0x44];
+        audio.Writer.TryWrite(sample);
+        audio.Writer.TryComplete();
+        var asr = new BailianClient((_, _) => Task.FromResult<WebSocket>(Interlocked.Increment(ref connections) == 1 ? stalled : healthy),
+            startupTimeout: TimeSpan.FromSeconds(2), log: logs.Add, startupRetryAfter: TimeSpan.FromMilliseconds(120));
+        var work = asr.RecognizeAsync(CloudSettings(), audio.Reader.ReadAllAsync(), CancellationToken.None);
+        _ = await stalled.TaskId();
+        string secondId = await healthy.TaskId();
+        healthy.Event("task-started", secondId);
+        Equal((WebSocketMessageType.Binary, "11223344"), await healthy.SentHex());
+        _ = await healthy.SentText(); // finish-task
+        healthy.Sentence(secondId, 1, "重试成功。", end: true);
+        healthy.Event("task-finished", secondId);
+        Equal("重试成功。", await work);
+        Equal(2, Volatile.Read(ref connections));
+        Equal(WebSocketState.Aborted, stalled.State);
+        True(logs.Any(line => line.Contains("正在重试连接")));
+    }
+
+    // 2. Translation retries once on transient HttpRequestException or handler ConnectTimeout, never on HTTP status errors.
+    int transportAttempts = 0;
+    using (var http = FakeHttp((_, _) => Interlocked.Increment(ref transportAttempts) == 1
+        ? Task.FromException<HttpResponseMessage>(new HttpRequestException(HttpRequestError.ResponseEnded))
+        : Task.FromResult(MtResponse("Recovered"))))
+    {
+        var batch = await new TranslationClient(http).TranslateAsync("你好",
+            CloudSettings() with { TranslationProvider = TranslationProvider.QwenMtFlash, TargetLanguages = ["EN-US"] },
+            CancellationToken.None);
+        Equal(2, transportAttempts);
+        Equal("Recovered", batch.Results.Single().Text);
+        Equal(0, batch.Errors.Count);
+    }
+
+    int connectTimeoutAttempts = 0;
+    using (var http = FakeHttp((_, _) => Interlocked.Increment(ref connectTimeoutAttempts) == 1
+        ? Task.FromException<HttpResponseMessage>(new TaskCanceledException("Simulated ConnectTimeout"))
+        : Task.FromResult(MtResponse("After timeout"))))
+    {
+        var batch = await new TranslationClient(http).TranslateAsync("你好",
+            CloudSettings() with { TranslationProvider = TranslationProvider.QwenMtFlash, TargetLanguages = ["EN-US"] },
+            CancellationToken.None);
+        Equal(2, connectTimeoutAttempts);
+        Equal("After timeout", batch.Results.Single().Text);
+    }
+
+    int statusAttempts = 0;
+    using (var http = FakeHttp((_, _) => { Interlocked.Increment(ref statusAttempts); return Task.FromResult(new HttpResponseMessage(HttpStatusCode.TooManyRequests)); }))
+    {
+        var batch = await new TranslationClient(http).TranslateAsync("你好",
+            CloudSettings() with { TranslationProvider = TranslationProvider.QwenMtFlash, TargetLanguages = ["EN-US"] },
+            CancellationToken.None);
+        Equal(1, statusAttempts);
+        True(batch.Errors.Single().Contains("429"));
+    }
+}
+
 static string ReadOsc(byte[] data, ref int offset)
 {
     int end = Array.IndexOf(data, (byte)0, offset);
@@ -1525,6 +1699,7 @@ sealed class FakeSocket(bool ignoreReceiveCancellation = false) : WebSocket
     public override WebSocketState State => state;
     public override void Abort() { state = WebSocketState.Aborted; fromServer.Writer.TryComplete(); }
     public override void Dispose() => Abort();
+    public void CloseFromServer() => fromServer.Writer.TryWrite(([], WebSocketMessageType.Close, true));
     public override Task CloseAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken) => Task.CompletedTask;
     public override Task CloseOutputAsync(WebSocketCloseStatus closeStatus, string? statusDescription, CancellationToken cancellationToken) => Task.CompletedTask;
 

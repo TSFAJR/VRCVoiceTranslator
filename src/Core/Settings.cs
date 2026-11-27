@@ -131,8 +131,7 @@ public sealed class SettingsStore(string path)
     {
         if (!File.Exists(Path)) { Save(new Settings { Window = layout }); return; }
         // Geometry is saved independently of the settings form. Preserve external edits and unknown fields.
-        using var document = JsonDocument.Parse(File.ReadAllBytes(Path));
-        _ = Decode(document.RootElement);
+        using var document = ReadExistingDocument(out _);
         WriteAtomically(stream =>
         {
             using var writer = new Utf8JsonWriter(stream, new() { Indented = true });
@@ -158,23 +157,41 @@ public sealed class SettingsStore(string path)
             }
             File.Move(temporary, Path, overwrite: true);
         }
-        finally { File.Delete(temporary); }
+        finally
+        {
+            try { if (File.Exists(temporary)) File.Delete(temporary); }
+            catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+        }
     }
 
     private Settings ReadExisting()
     {
+        using var document = ReadExistingDocument(out var settings);
+        return settings;
+    }
+
+    private JsonDocument ReadExistingDocument(out Settings settings)
+    {
+        JsonDocument? document = null;
         try
         {
             using var stream = File.OpenRead(Path);
-            using var document = JsonDocument.Parse(stream);
-            return Decode(document.RootElement);
+            document = JsonDocument.Parse(stream);
+            settings = Decode(document.RootElement);
+            return document;
         }
         catch (Exception exception) when (exception is JsonException or FormatException)
         {
+            document?.Dispose();
             string reason = exception is JsonException json
                 ? $"JSON 解析失败，字段 {json.Path ?? "$"}，第 {(json.LineNumber ?? 0) + 1} 行，字节位置 {json.BytePositionInLine ?? 0}。"
                 : exception.Message;
             throw new FormatException($"{Path}{Environment.NewLine}{reason}");
+        }
+        catch
+        {
+            document?.Dispose();
+            throw;
         }
     }
 

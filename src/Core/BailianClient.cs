@@ -18,13 +18,16 @@ public sealed class BailianClient
     private const int FrameBytes = 3200;
     private readonly Func<Settings, CancellationToken, Task<WebSocket>> connect;
     private readonly TimeSpan startupTimeout;
+    private readonly TimeSpan startupRetryAfter;
     private readonly Action<string>? log;
 
     public BailianClient(Func<Settings, CancellationToken, Task<WebSocket>>? connect = null, TimeSpan? startupTimeout = null,
-        Action<string>? log = null)
+        Action<string>? log = null, TimeSpan? startupRetryAfter = null)
     {
         this.connect = connect ?? ConnectAsync;
         this.startupTimeout = startupTimeout ?? TimeSpan.FromSeconds(8);
+        this.startupRetryAfter = startupRetryAfter ??
+            (this.startupTimeout >= TimeSpan.FromSeconds(4) ? TimeSpan.FromSeconds(2) : Timeout.InfiniteTimeSpan);
         this.log = log;
     }
 
@@ -46,7 +49,6 @@ public sealed class BailianClient
     {
         if (BailianEndpoints.ConfigurationError(settings) is { } error) throw new ServiceException(error);
 
-        var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var finishing = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         using var lifetime = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         using var startup = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token);
@@ -54,21 +56,43 @@ public sealed class BailianClient
         WebSocket? socket = null;
         Task<string>? receiver = null;
         Task? sender = null;
-        string id = Guid.NewGuid().ToString();
         var hotwords = settings.RecognitionHotwordsEnabled ? settings.RecognitionHotwords : null;
         bool incoming = onSentence is not null;
+        string source = incoming ? "来话" : "麦克风";
         try
         {
-            socket = await connect(settings, startup.Token).ConfigureAwait(false);
-            await SendJsonAsync(socket, "run-task", id, RunPayload(settings, incoming, hotwords), startup.Token).ConfigureAwait(false);
-            receiver = ReceiveResultsAsync(socket, id, ready, finishing.Task, onSentence, lifetime.Token);
-            var startedOrEnded = await Task.WhenAny(ready.Task, receiver).WaitAsync(startup.Token).ConfigureAwait(false);
-            if (startedOrEnded == receiver) return await receiver.ConfigureAwait(false);
+            string id = "";
+            for (int attempt = 0; ; attempt++)
+            {
+                bool canRetry = attempt == 0 && startupRetryAfter > TimeSpan.Zero && startupRetryAfter < startupTimeout;
+                using var attemptLimit = canRetry ? CancellationTokenSource.CreateLinkedTokenSource(startup.Token) : null;
+                attemptLimit?.CancelAfter(startupRetryAfter);
+                var attemptToken = attemptLimit?.Token ?? startup.Token;
+                var ready = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                id = Guid.NewGuid().ToString();
+                try
+                {
+                    socket = await connect(settings, attemptToken).ConfigureAwait(false);
+                    await SendJsonAsync(socket, "run-task", id, RunPayload(settings, incoming, hotwords), attemptToken).ConfigureAwait(false);
+                    receiver = ReceiveResultsAsync(socket, id, ready, finishing.Task, onSentence, lifetime.Token);
+                    var startedOrEnded = await Task.WhenAny(ready.Task, receiver).WaitAsync(attemptToken).ConfigureAwait(false);
+                    if (startedOrEnded == receiver) return await receiver.ConfigureAwait(false);
+                    break;
+                }
+                catch (OperationCanceledException) when (canRetry && !startup.IsCancellationRequested && attemptLimit!.IsCancellationRequested)
+                {
+                    log?.Invoke($"{source}识别启动较慢，正在重试连接。");
+                    socket?.Abort();
+                    await ObserveAsync(receiver).ConfigureAwait(false);
+                    socket?.Dispose();
+                    socket = null;
+                    receiver = null;
+                }
+            }
             startup.CancelAfter(Timeout.InfiniteTimeSpan);
             if (log is not null)
             {
                 int strong = hotwords?.Values.Count(weight => weight == RecognitionVocabulary.StrongWeight) ?? 0;
-                string source = incoming ? "来话" : "麦克风";
                 string context = settings.Terminology.Context.Length > 0 ? "已附带" : "无";
                 log($"{source}识别任务已启动 · 请求附带热词 {hotwords?.Count ?? 0} 条（加强 {strong} 条），上下文{context}。");
             }
@@ -79,8 +103,9 @@ public sealed class BailianClient
             if (first == sender)
             {
                 await sender.ConfigureAwait(false);
-                if (onSentence is not null)
-                    return await receiver.WaitAsync(TimeSpan.FromSeconds(5), lifetime.Token).ConfigureAwait(false);
+                return onSentence is not null
+                    ? await receiver.WaitAsync(TimeSpan.FromSeconds(5), lifetime.Token).ConfigureAwait(false)
+                    : await receiver.ConfigureAwait(false);
             }
             string result = await receiver.ConfigureAwait(false);
             await sender.ConfigureAwait(false);
@@ -103,9 +128,9 @@ public sealed class BailianClient
         {
             lifetime.Cancel();
             socket?.Abort();
-            socket?.Dispose();
             await ObserveAsync(sender).ConfigureAwait(false);
             await ObserveAsync(receiver).ConfigureAwait(false);
+            socket?.Dispose();
         }
     }
 

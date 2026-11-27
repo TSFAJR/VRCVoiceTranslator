@@ -37,11 +37,11 @@ public static class SpeechExpression
         new("gasp", "倒吸气", true), new("clears throat", "清嗓", true), new("cough", "咳嗽", true),
         new("snorts", "嗤笑", true)
     ]);
-    private static readonly HashSet<string> tagIds = Tags.Select(tag => tag.Id).ToHashSet(StringComparer.Ordinal);
+    private static readonly Dictionary<string, SpeechTag> TagsById = Tags.ToDictionary(tag => tag.Id, StringComparer.Ordinal);
     public static IReadOnlyList<SpeechKeyword> Defaults { get; } = Array.AsReadOnly<SpeechKeyword>(
         [new("太好了", "excited"), new("好耶", "excited"), new("真的假的", "curious"), new("别着急", "empathetic")]);
 
-    internal static bool IsSelection(string selection) => selection is Auto or Plain || tagIds.Contains(selection);
+    internal static bool IsSelection(string? selection) => selection is Auto or Plain || (selection is not null && TagsById.ContainsKey(selection));
 
     public static IReadOnlyList<SpeechKeyword> ValidateRules(IReadOnlyList<SpeechKeyword>? rules)
     {
@@ -54,7 +54,7 @@ public static class SpeechExpression
             if (!phrase.Any(char.IsLetterOrDigit) || phrase.Any(c => char.IsControl(c) || c is '\u2028' or '\u2029'))
                 throw new FormatException($"第 {normalized.Count + 1} 行关键词需为单行，并至少包含一个文字或数字。");
             if (!seen.Add(phrase)) throw new FormatException($"第 {normalized.Count + 1} 行关键词重复。");
-            if (!tagIds.Contains(rule!.Tag)) throw new FormatException($"第 {normalized.Count + 1} 行请选择支持的语气标签。");
+            if (rule!.Tag is null || !TagsById.ContainsKey(rule.Tag)) throw new FormatException($"第 {normalized.Count + 1} 行请选择支持的语气标签。");
             normalized.Add(rule with { Phrase = phrase });
         }
         return normalized.AsReadOnly();
@@ -69,8 +69,7 @@ public static class SpeechExpression
             _ => settings.Expression
         };
         // Keep a valid full-length utterance playable if the optional prefix would exceed the limit.
-        if (tag is null) return new(spoken, null);
-        var choice = Tags.First(option => option.Id == tag);
+        if (tag is null || !TagsById.TryGetValue(tag, out var choice)) return new(spoken, null);
         if (spoken.Length + tag.Length + 2 > BailianTtsClient.MaxTextLength)
             return new(spoken, null, choice.IsSound ? null : choice);
         return new($"[{tag}]{spoken}", null, choice);

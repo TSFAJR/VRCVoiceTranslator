@@ -6,17 +6,20 @@ namespace VrcTranslator.Desktop;
 internal sealed class SpeechPlayback : IDisposable
 {
     private readonly CancellationTokenSource stop = new();
+    private readonly PreparedSocket? prepared;
     private readonly SpeechRenderOutput output;
     private readonly SpeechRenderOutput? monitor;
     private string? monitorWarning;
 
-    public SpeechPlayback(BailianTtsClient tts, SpeechSelection selection, Settings settings, long readyAt, Action<string> log)
+    public SpeechPlayback(BailianTtsClient tts, SpeechSelection selection, Settings settings, long readyAt, Action<string> log,
+        PreparedSocket? prepared = null)
     {
+        this.prepared = prepared;
         var options = settings.Speech;
         output = new(options.OutputDeviceId, options.VolumePercent, stop.Token,
             () => log($"播报文本就绪至开始播放：{Stopwatch.GetElapsedTime(readyAt).TotalMilliseconds:F0} 毫秒"));
         if (options.MonitorEnabled)
-            monitor = new(options.MonitorDeviceId, options.VolumePercent, stop.Token, () => { }, output.Endpoint);
+            monitor = new(options.MonitorDeviceId, options.VolumePercent, stop.Token, () => { }, output.Endpoint, queueCapacity: 48);
         Work = Task.Run(() => RunAsync(tts, settings, selection, readyAt, log));
     }
 
@@ -57,24 +60,29 @@ internal sealed class SpeechPlayback : IDisposable
     {
         bool first = true;
         bool monitoring = monitor is not null;
+        bool usedPrepared = false;
         await tts.SynthesizeAsync(selection.Text!, settings, async (pcm, cancellation) =>
         {
             cancellation.ThrowIfCancellationRequested();
             if (first)
             {
                 first = false;
-                log($"播报文本就绪至首个音频块：{Stopwatch.GetElapsedTime(readyAt).TotalMilliseconds:F0} 毫秒");
+                log($"播报文本就绪至首个音频块：{Stopwatch.GetElapsedTime(readyAt).TotalMilliseconds:F0} 毫秒{(usedPrepared ? "（预连）" : "")}");
             }
 
             var block = pcm.ToArray();
             await output.Input.WriteAsync(block, cancellation).ConfigureAwait(false);
-            if (monitoring && monitor is { Work.IsCompleted: false } destination && !destination.Input.TryWrite(block))
+            if (monitoring && monitor is { } destination)
             {
-                monitoring = false;
-                destination.Input.TryComplete();
-                ReportMonitorWarning("监听跟不上，已停止向监听设备送入后续音频。", log);
+                if (destination.Work.IsCompleted) monitoring = false;
+                else if (!destination.Input.TryWrite(block))
+                {
+                    monitoring = false;
+                    destination.Input.TryComplete();
+                    ReportMonitorWarning("监听跟不上，已停止向监听设备送入后续音频。", log);
+                }
             }
-        }, stop.Token, selection.Tag).ConfigureAwait(false);
+        }, stop.Token, selection.Tag, prepared, hit => usedPrepared = hit).ConfigureAwait(false);
         output.Input.TryComplete();
         monitor?.Input.TryComplete();
     }
@@ -100,5 +108,9 @@ internal sealed class SpeechPlayback : IDisposable
     private string WithMonitorWarning(string state) =>
         Volatile.Read(ref monitorWarning) is { } warning ? $"{state} · {warning}" : state;
 
-    public void Dispose() => stop.Dispose();
+    public void Dispose()
+    {
+        prepared?.Dispose();
+        stop.Dispose();
+    }
 }

@@ -258,6 +258,7 @@ internal sealed class SettingsWindow : Form
         if (currentLayout is null) return;
         if (WindowState == FormWindowState.Normal) currentLayout = NormalLayout();
         else if (WindowState == FormWindowState.Maximized) currentLayout = currentLayout with { Maximized = true };
+        if (savedLayout is not null && currentLayout.Maximized != savedLayout.Maximized) SaveWindowLayout();
     }
 
     public void RestoreFromMinimized()
@@ -441,7 +442,12 @@ internal sealed class SettingsWindow : Form
         translation.Place(targets, 167, 47, 547, 2 * LanguageOrder.LogicalItemHeight);
         var add = MakeButton("添加语言", SettingsButtonStyle.Outline, SettingsGlyph.Plus, () =>
         {
-            if (LanguageOrder.ChooseLanguage(this, Font) is { } code) targets.AddLanguage(code);
+            runtime.SetKeyboardPaused(true);
+            try
+            {
+                if (LanguageOrder.ChooseLanguage(this, Font) is { } code) targets.AddLanguage(code);
+            }
+            finally { runtime.SetKeyboardPaused(assigningKey || manualChatbox.Focused); }
         });
         translation.Place(add, 167, 121, 152, 28);
         translation.Place(hotwordButton, 536, 121, 178, 28);
@@ -858,7 +864,7 @@ internal sealed class SettingsWindow : Form
                 Terminology = terminology,
                 ChatboxEnabled = chatEnabled.Checked, OscPort = (int)oscPort.Value, Subtitles = ReadSubtitles(), Speech = ReadSpeech()
             });
-            runtime.Apply(updated);
+            runtime.Apply(updated, clearError: true);
             savedLayout = currentLayout;
             MaskPasswords();
             savedUntil = DateTime.UtcNow.AddSeconds(3);
@@ -972,10 +978,12 @@ internal sealed class SettingsWindow : Form
             help.SetToolTip(binding, status.Vr);
             help.SetToolTip(steamStatus, status.Vr);
         }
-        if (translationNotice.Text != status.TranslationNotice)
+        string noticeText = status.Error.Length > 0 ? status.Error : status.TranslationNotice;
+        translationNotice.ForeColor = status.Error.Length > 0 ? UiTheme.Amber : UiTheme.Muted;
+        if (translationNotice.Text != noticeText)
         {
-            translationNotice.Text = status.TranslationNotice;
-            help.SetToolTip(translationNotice, status.TranslationNotice);
+            translationNotice.Text = noticeText;
+            help.SetToolTip(translationNotice, noticeText);
         }
         incomingToggle.Checked = status.IncomingActive;
         incomingNoiseFilter.Enabled = !status.IncomingActive;

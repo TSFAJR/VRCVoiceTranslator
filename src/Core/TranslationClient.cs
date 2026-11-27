@@ -18,7 +18,8 @@ public sealed class TranslationClient(HttpClient http, TimeSpan? timeout = null)
     private readonly TimeSpan wait = timeout ?? TimeSpan.FromSeconds(5);
 
     public static string? ConfigurationError(Settings settings) => settings.TranslationProvider == TranslationProvider.DeepL
-        ? (string.IsNullOrWhiteSpace(settings.DeepLApiKey) ? "请填写 DeepL API Key。" : null)
+        ? (string.IsNullOrWhiteSpace(settings.DeepLApiKey) ? "请填写 DeepL API Key。"
+            : BailianEndpoints.IsValidHeaderToken(settings.DeepLApiKey) ? null : "DeepL API Key 包含无效字符，请重新粘贴。")
         : BailianEndpoints.ConfigurationError(settings);
 
     public async Task<TranslationBatch> TranslateAsync(string original, Settings settings, CancellationToken cancellation,
@@ -41,9 +42,10 @@ public sealed class TranslationClient(HttpClient http, TimeSpan? timeout = null)
 
         using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
         deadline.CancelAfter(wait);
+        var deadlineToken = deadline.Token;
         int requestedTermCount = 0;
         var tasks = targets.Select(TranslateTargetAsync).ToArray();
-        try { await Task.WhenAll(tasks).WaitAsync(deadline.Token).ConfigureAwait(false); }
+        try { await Task.WhenAll(tasks).WaitAsync(deadlineToken).ConfigureAwait(false); }
         catch (OperationCanceledException) when (!cancellation.IsCancellationRequested) { }
         cancellation.ThrowIfCancellationRequested();
 
@@ -57,17 +59,17 @@ public sealed class TranslationClient(HttpClient http, TimeSpan? timeout = null)
             if (result.Error is { } error) errors.Add(error);
             if (result.Notice is { } notice) notices.Add(notice);
         }
-        return new(results, errors) { Notices = notices, RequestedTermCount = requestedTermCount };
+        return new(results, errors) { Notices = notices, RequestedTermCount = Volatile.Read(ref requestedTermCount) };
 
         async Task<Outcome> TranslateTargetAsync(string target)
         {
-            deadline.Token.ThrowIfCancellationRequested();
+            if (deadlineToken.IsCancellationRequested) return new(null, $"{target} 翻译超时。");
             Outcome result;
             if (useDeepL)
             {
                 var body = new Dictionary<string, object> { ["text"] = new[] { original }, ["target_lang"] = target };
                 if (source is not null) body["source_lang"] = source;
-                result = await RequestAsync(endpoint, "DeepL-Auth-Key", settings.DeepLApiKey, body, target, ParseDeepL, deadline.Token)
+                result = await RequestAsync(endpoint, "DeepL-Auth-Key", settings.DeepLApiKey, body, target, ParseDeepL, deadlineToken)
                     .ConfigureAwait(false);
             }
             else
@@ -88,10 +90,10 @@ public sealed class TranslationClient(HttpClient http, TimeSpan? timeout = null)
                     messages = new[] { new { role = "user", content = original } },
                     translation_options = options
                 };
-                result = await RequestAsync(endpoint, "Bearer", settings.BailianApiKey, body, target, ParseQwen, deadline.Token)
+                result = await RequestAsync(endpoint, "Bearer", settings.BailianApiKey, body, target, ParseQwen, deadlineToken)
                     .ConfigureAwait(false);
             }
-            if (result.Value is { } translation && !deadline.IsCancellationRequested) onTranslation?.Invoke(translation);
+            if (result.Value is { } translation && !deadlineToken.IsCancellationRequested) onTranslation?.Invoke(translation);
             return result;
 
             Outcome ParseDeepL(JsonElement response)
@@ -118,21 +120,34 @@ public sealed class TranslationClient(HttpClient http, TimeSpan? timeout = null)
     private async Task<Outcome> RequestAsync(Uri endpoint, string scheme, string key, object body, string target,
         Func<JsonElement, Outcome> parse, CancellationToken cancellation)
     {
-        try
+        for (int attempt = 0; ; attempt++)
         {
-            using var request = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = JsonContent.Create(body) };
-            request.Headers.Authorization = new AuthenticationHeaderValue(scheme, key);
-            using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellation).ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode) return new(null, $"{target} 翻译失败（HTTP {(int)response.StatusCode}）。");
-            using var document = await JsonDocument.ParseAsync(await response.Content.ReadAsStreamAsync(cancellation).ConfigureAwait(false),
-                cancellationToken: cancellation).ConfigureAwait(false);
-            if (cancellation.IsCancellationRequested) return new(null, $"{target} 翻译超时。");
-            return parse(document.RootElement);
+            try
+            {
+                using var request = new HttpRequestMessage(HttpMethod.Post, endpoint) { Content = JsonContent.Create(body) };
+                request.Headers.Authorization = new AuthenticationHeaderValue(scheme, key);
+                using var response = await http.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellation).ConfigureAwait(false);
+                if (!response.IsSuccessStatusCode) return new(null, $"{target} 翻译失败（HTTP {(int)response.StatusCode}）。");
+                await using var stream = await response.Content.ReadAsStreamAsync(cancellation).ConfigureAwait(false);
+                using var document = await JsonDocument.ParseAsync(stream, cancellationToken: cancellation).ConfigureAwait(false);
+                if (cancellation.IsCancellationRequested) return new(null, $"{target} 翻译超时。");
+                return parse(document.RootElement);
+            }
+            catch (OperationCanceledException) when (attempt == 0 && !cancellation.IsCancellationRequested)
+            {
+                // Handler-level ConnectTimeout fired while the shared translation deadline still has time.
+                continue;
+            }
+            catch (HttpRequestException) when (attempt == 0 && !cancellation.IsCancellationRequested)
+            {
+                // Retry once on transient transport or stale keep-alive failures within the shared deadline.
+                continue;
+            }
+            catch (OperationCanceledException) { return new(null, $"{target} 翻译超时。"); }
+            catch (HttpRequestException exception) { return new(null, $"{target} 网络请求失败（{exception.HttpRequestError}）。"); }
+            catch (Exception exception) when (exception is JsonException or KeyNotFoundException or IndexOutOfRangeException or InvalidOperationException or IOException or FormatException)
+            { return new(null, $"{target} 翻译请求或响应格式无效。"); }
         }
-        catch (OperationCanceledException) { return new(null, $"{target} 翻译超时。"); }
-        catch (HttpRequestException exception) { return new(null, $"{target} 网络请求失败（{exception.HttpRequestError}）。"); }
-        catch (Exception exception) when (exception is JsonException or KeyNotFoundException or IndexOutOfRangeException or InvalidOperationException or IOException or FormatException)
-        { return new(null, $"{target} 翻译请求或响应格式无效。"); }
     }
 
     private static Outcome TextOutcome(string target, string? text) => string.IsNullOrWhiteSpace(text)
